@@ -85,13 +85,22 @@ class LanguageServerManager:
         return next(iter(self._language_servers.values()))
 
     @staticmethod
-    def from_languages(languages: list[Language], factory: LanguageServerFactory) -> "LanguageServerManager":
+    def from_languages(
+        languages: list[Language],
+        factory: LanguageServerFactory,
+        startup_timeout: float | None = None,
+    ) -> "LanguageServerManager":
         """
         Creates a manager with language servers for the given languages using the given factory.
         The language servers are started in parallel threads.
 
         :param languages: the languages for which to spawn language servers
         :param factory: the factory for language server creation
+        :param startup_timeout: per-language watchdog (seconds) on `LanguageServer.start()`. If a
+            language server does not finish starting within this budget, it is marked as failed and
+            a `LanguageServerManagerInitialisationError` is raised — instead of hanging indefinitely.
+            Threads run in parallel so the total wall-clock bound is approximately `startup_timeout`,
+            not `N * startup_timeout`. None disables the watchdog (legacy behaviour).
         :return: the instance
         """
 
@@ -124,7 +133,28 @@ class LanguageServerManager:
         language_servers: dict[Language, SolidLanguageServer] = {}
         exceptions: dict[Language, Exception] = {}
         for thread in threads:
-            thread.join()
+            thread.join(timeout=startup_timeout)
+            if thread.is_alive():
+                # Startup exceeded the watchdog. Record a timeout error for this language and
+                # attempt a best-effort stop of the (possibly partially-started) language server so
+                # we do not leak subprocesses. Exceptions here are swallowed deliberately — we are
+                # already in the failure path and must not block the caller further.
+                timeout_msg = (
+                    f"Language server startup for language {thread.language.value} timed out "
+                    f"after {startup_timeout}s"
+                )
+                log.error(timeout_msg)
+                exceptions[thread.language] = TimeoutError(timeout_msg)
+                ls = thread.language_server
+                if ls is not None:
+                    try:
+                        ls.stop()
+                    except Exception as stop_err:
+                        log.warning(
+                            f"Best-effort stop of {thread.language.value} language server after startup "
+                            f"timeout raised: {stop_err}"
+                        )
+                continue
             if thread.exception is not None:
                 exceptions[thread.language] = thread.exception
             elif thread.language_server is not None:

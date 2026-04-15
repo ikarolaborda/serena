@@ -29,6 +29,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+IGNORE_SPEC_WAIT_TIMEOUT_S: float = 60.0
+"""Maximum time a consumer of `_ignore_spec`/`_ignored_patterns` will wait for the background
+gather-ignorespec thread to finish. Guards against the thread wedging before it can signal
+completion (the exception path now signals via a finally, but an OS-level wedge could still
+prevent that). Normal completion takes well under a second on a typical repo."""
+
 
 class MemoriesManager:
     GLOBAL_TOPIC = "global"
@@ -306,38 +312,51 @@ class Project(ToStringMixin):
         self.__ignored_patterns: list[str]
         self.__ignore_spec: pathspec.PathSpec
         self._ignore_spec_available = threading.Event()
+        # Capture any exception raised during async gather so consumers can re-raise it instead
+        # of deadlocking on a wait() that never unblocks.
+        self._ignore_spec_error: Exception | None = None
         threading.Thread(name=f"gather-ignorespec[{self.project_config.project_name}]", target=self._gather_ignorespec, daemon=True).start()
 
     def _gather_ignorespec(self) -> None:
-        with LogTime(f"Gathering ignore spec for project {self.project_config.project_name}", logger=log):
-            # gather ignored paths from the global configuration, project configuration, and gitignore files
-            global_ignored_paths = self.serena_config.ignored_paths
-            ignored_patterns = list(global_ignored_paths) + list(self.project_config.ignored_paths)
-            if len(global_ignored_paths) > 0:
-                log.info(f"Using {len(global_ignored_paths)} ignored paths from the global configuration.")
-                log.debug(f"Global ignored paths: {list(global_ignored_paths)}")
-            if len(self.project_config.ignored_paths) > 0:
-                log.info(f"Using {len(self.project_config.ignored_paths)} ignored paths from the project configuration.")
-                log.debug(f"Project ignored paths: {self.project_config.ignored_paths}")
-            log.debug(f"Combined ignored patterns: {ignored_patterns}")
-            if self.project_config.ignore_all_files_in_gitignore:
-                gitignore_parser = GitignoreParser(self.project_root)
-                for spec in gitignore_parser.get_ignore_specs():
-                    log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
-                    ignored_patterns.extend(spec.patterns)
-            self.__ignored_patterns = ignored_patterns
+        try:
+            with LogTime(f"Gathering ignore spec for project {self.project_config.project_name}", logger=log):
+                # gather ignored paths from the global configuration, project configuration, and gitignore files
+                global_ignored_paths = self.serena_config.ignored_paths
+                ignored_patterns = list(global_ignored_paths) + list(self.project_config.ignored_paths)
+                if len(global_ignored_paths) > 0:
+                    log.info(f"Using {len(global_ignored_paths)} ignored paths from the global configuration.")
+                    log.debug(f"Global ignored paths: {list(global_ignored_paths)}")
+                if len(self.project_config.ignored_paths) > 0:
+                    log.info(f"Using {len(self.project_config.ignored_paths)} ignored paths from the project configuration.")
+                    log.debug(f"Project ignored paths: {self.project_config.ignored_paths}")
+                log.debug(f"Combined ignored patterns: {ignored_patterns}")
+                if self.project_config.ignore_all_files_in_gitignore:
+                    gitignore_parser = GitignoreParser(self.project_root)
+                    for spec in gitignore_parser.get_ignore_specs():
+                        log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
+                        ignored_patterns.extend(spec.patterns)
+                self.__ignored_patterns = ignored_patterns
 
-            # Set up the pathspec matcher for the ignored paths
-            # for all absolute paths in ignored_paths, convert them to relative paths
-            processed_patterns = []
-            for pattern in ignored_patterns:
-                # Normalize separators (pathspec expects forward slashes)
-                pattern = pattern.replace(os.path.sep, "/")
-                processed_patterns.append(pattern)
-            log.debug(f"Processing {len(processed_patterns)} ignored paths")
-            self.__ignore_spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, processed_patterns)
-
-        self._ignore_spec_available.set()
+                # Set up the pathspec matcher for the ignored paths
+                # for all absolute paths in ignored_paths, convert them to relative paths
+                processed_patterns = []
+                for pattern in ignored_patterns:
+                    # Normalize separators (pathspec expects forward slashes)
+                    pattern = pattern.replace(os.path.sep, "/")
+                    processed_patterns.append(pattern)
+                log.debug(f"Processing {len(processed_patterns)} ignored paths")
+                self.__ignore_spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, processed_patterns)
+        except Exception as e:
+            # Without capturing the exception here, the original code only signalled success
+            # via the Event, so a raised exception left every consumer blocked on wait() forever.
+            log.error(
+                f"gather-ignorespec for project {self.project_config.project_name} failed: {e}",
+                exc_info=e,
+            )
+            self._ignore_spec_error = e
+        finally:
+            # Always signal completion so waiters do not deadlock when gather raises.
+            self._ignore_spec_available.set()
 
     def _tostring_includes(self) -> list[str]:
         return []
@@ -388,16 +407,34 @@ class Project(ToStringMixin):
         abs_path = Path(self.project_root) / relative_path
         return FileUtils.read_file(str(abs_path), self.project_config.encoding)
 
+    def _await_ignore_spec(self, resource_name: str) -> None:
+        """
+        Block until the background ignore-spec gather finishes (success or failure).
+        Raises TimeoutError if gather does not signal within the bound, and RuntimeError
+        if gather itself raised — chaining the original cause so the underlying filesystem
+        or pathspec error is visible in the stack trace.
+        """
+        if not self._ignore_spec_available.is_set():
+            log.info(f"Waiting for {resource_name} to become available ...")
+            if not self._ignore_spec_available.wait(timeout=IGNORE_SPEC_WAIT_TIMEOUT_S):
+                raise TimeoutError(
+                    f"Timed out after {IGNORE_SPEC_WAIT_TIMEOUT_S}s waiting for {resource_name} "
+                    f"for project {self.project_name}; gather-ignorespec thread may be wedged"
+                )
+            log.info(f"{resource_name.capitalize()} is now available for project; proceeding")
+        if self._ignore_spec_error is not None:
+            raise RuntimeError(
+                f"Ignore-spec gathering failed for project {self.project_name}; "
+                f"cannot proceed with project initialization"
+            ) from self._ignore_spec_error
+
     @property
     def _ignore_spec(self) -> pathspec.PathSpec:
         """
         :return: the pathspec matcher for the paths that were configured to be ignored,
             either explicitly or implicitly through .gitignore files.
         """
-        if not self._ignore_spec_available.is_set():
-            log.info("Waiting for ignore spec to become available ...")
-            self._ignore_spec_available.wait()
-            log.info("Ignore spec is now available for project; proceeding")
+        self._await_ignore_spec("ignore spec")
         return self.__ignore_spec
 
     @property
@@ -405,10 +442,7 @@ class Project(ToStringMixin):
         """
         :return: the list of ignored path patterns
         """
-        if not self._ignore_spec_available.is_set():
-            log.info("Waiting for ignored patterns to become available ...")
-            self._ignore_spec_available.wait()
-            log.info("Ignore patterns are now available for project; proceeding")
+        self._await_ignore_spec("ignored patterns")
         return self.__ignored_patterns
 
     def _is_ignored_relative_path(self, relative_path: str | Path, ignore_non_source_files: bool = True) -> bool:
@@ -646,7 +680,11 @@ class Project(ToStringMixin):
                 ls_specific_settings=ls_specific_settings,
                 trace_lsp_communication=self.serena_config.trace_lsp_communication,
             )
-            self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory)
+            self.language_server_manager = LanguageServerManager.from_languages(
+                self.project_config.languages,
+                factory,
+                startup_timeout=self.serena_config.ls_startup_timeout,
+            )
             return self.language_server_manager
         except Exception as e:
             self._language_server_manager_init_error = e

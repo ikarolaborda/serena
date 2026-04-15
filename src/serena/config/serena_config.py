@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 T = TypeVar("T")
 DEFAULT_TOOL_TIMEOUT: float = 240
+DEFAULT_LS_STARTUP_TIMEOUT: float = 180.0
+"""Per-language language-server startup budget (seconds). Kept separate from tool_timeout so that a user
+who intentionally disables request timeouts (tool_timeout: null) still gets a bounded startup and cannot
+hang the agent task queue during project activation. Default sized to tolerate slow first-run dependency
+installs (e.g. Pyright downloading Node, Omnisharp fetching dotnet) on constrained networks like WSL2."""
 DictType = dict | CommentedMap
 TDict = TypeVar("TDict", bound=DictType)
 
@@ -681,6 +686,7 @@ class SerenaConfig(SharedConfig):
     web_dashboard_listen_address: str = "127.0.0.1"
     jetbrains_plugin_server_address: str = "127.0.0.1"
     tool_timeout: float = DEFAULT_TOOL_TIMEOUT
+    ls_startup_timeout: float = DEFAULT_LS_STARTUP_TIMEOUT
 
     token_count_estimator: str = RegisteredTokenCountEstimator.CHAR_COUNT.name
     """Only relevant if `record_tool_usage` is True; the name of the token count estimator to use for tool usage statistics.

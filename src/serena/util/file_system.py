@@ -164,7 +164,16 @@ class GitignoreParser:
         queue: list[str] = [self.repo_root]
 
         def scan(abs_path: str | None) -> Iterator[str]:
-            for entry in os.scandir(abs_path):
+            # os.scandir itself raises PermissionError when the directory is unreadable (common
+            # when a container writes as root with mode 0700 inside a user-owned project tree).
+            # Without this guard, a single unreadable subtree aborts the whole gather and — in
+            # combination with the existing async gather pattern — deadlocks project activation.
+            try:
+                entries = list(os.scandir(abs_path))
+            except (PermissionError, OSError) as ex:
+                log.warning(f"Skipping directory due to OS error: {abs_path} ({ex})")
+                return
+            for entry in entries:
                 try:
                     if entry.is_dir(follow_symlinks=follow_symlinks):
                         queue.append(entry.path)

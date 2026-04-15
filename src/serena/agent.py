@@ -847,7 +847,13 @@ class SerenaAgent:
 
         # initialize the language server in the background (if in language server mode)
         if self.get_language_backend().is_lsp():
-            self.issue_task(init_language_server_manager)
+            # Bounded task-level timeout so that a stuck LS startup cannot stall the agent's single-thread
+            # task executor forever and block every subsequent tool call. A generous headroom above the
+            # per-language startup watchdog lets the inner bound surface a clearer, language-scoped error.
+            self.issue_task(
+                init_language_server_manager,
+                timeout=self.serena_config.ls_startup_timeout + 30,
+            )
 
         if self._project_activation_callback is not None:
             self._project_activation_callback()

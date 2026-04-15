@@ -342,6 +342,11 @@ class LanguageServerProcess:
                     break
                 line = self.process.stdout.readline()
                 if not line:
+                    # Empty read means either EOF (process exited) or a transient empty state.
+                    # Exit immediately on EOF to avoid busy-spinning; back off briefly otherwise.
+                    if self.process.poll() is not None:
+                        break
+                    time.sleep(0.05)
                     continue
                 try:
                     num_bytes = content_length(line)
@@ -382,6 +387,11 @@ class LanguageServerProcess:
                     break
                 line = self.process.stderr.readline()
                 if not line:
+                    # Empty read means either EOF (process exited) or a transient empty state.
+                    # Exit immediately on EOF to avoid busy-spinning; back off briefly otherwise.
+                    if self.process.poll() is not None:
+                        break
+                    time.sleep(0.05)
                     continue
                 line_str = line.decode(ENCODING, errors="replace")
                 level = self._determine_log_level(line_str)
