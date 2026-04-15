@@ -4,7 +4,7 @@ Tools supporting the general workflow of the agent
 
 import platform
 
-from serena.tools import ReadMemoryTool, Tool, ToolMarkerDoesNotRequireActiveProject, WriteMemoryTool
+from serena.tools import ReadMemoryTool, Tool, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
 
 
 class CheckOnboardingPerformedTool(Tool):
@@ -55,6 +55,48 @@ class OnboardingTool(Tool):
             return "Memory writing tool not activated, skipping onboarding."
         system = platform.system()
         return self.prompt_factory.create_onboarding_prompt(system=system)
+
+
+class ThinkAboutCollectedInformationTool(Tool, ToolMarkerOptional):
+    """
+    Thinking tool for pondering the completeness of collected information.
+    """
+
+    def apply(self) -> str:
+        """
+        Think about the collected information and whether it is sufficient and relevant.
+        This tool should ALWAYS be called after you have completed a non-trivial sequence of searching steps like
+        find_symbol, find_referencing_symbols, search_for_pattern, read_file, etc.
+        """
+        return self.prompt_factory.create_think_about_collected_information()
+
+
+class ThinkAboutTaskAdherenceTool(Tool, ToolMarkerOptional):
+    """
+    Thinking tool for determining whether the agent is still on track with the current task.
+    """
+
+    def apply(self) -> str:
+        """
+        Think about the task at hand and whether you are still on track.
+        Especially important if the conversation has been going on for a while and there
+        has been a lot of back and forth.
+
+        This tool should ALWAYS be called before you insert, replace, or delete code.
+        """
+        return self.prompt_factory.create_think_about_task_adherence()
+
+
+class ThinkAboutWhetherYouAreDoneTool(Tool, ToolMarkerOptional):
+    """
+    Thinking tool for determining whether the task is truly completed.
+    """
+
+    def apply(self) -> str:
+        """
+        Whenever you feel that you are done with what the user has asked for, it is important to call this tool.
+        """
+        return self.prompt_factory.create_think_about_whether_you_are_done()
 
 
 class InitialInstructionsTool(Tool, ToolMarkerDoesNotRequireActiveProject):

@@ -34,3 +34,44 @@ prompts:
     Moreover, you should create memory files for the style and conventions and a dedicated memory file for
     what should be done when a task is completed.
     **Important**: after done with the onboarding task, remember to call the `write_memory` to save the collected information!
+
+  think_about_collected_information: |
+    STOP. Before any further action, write out a direct answer to each of the following. Do not skip any. Do not collapse them into prose.
+
+    1. Restate the task in one sentence in your own words. If you cannot, you do not understand it yet — ask the user before doing anything else.
+    2. List the concrete evidence you have actually retrieved so far (file paths, symbol name_paths, line numbers, exact command outputs, test names). Do NOT list things you merely inferred, recalled from training data, or assumed.
+    3. For every assumption you are about to act on, name one specific tool call (find_symbol / find_referencing_symbols / read file / test run / docs lookup) that would confirm or refute it. If you cannot name such a call, that assumption is currently unsupported — flag it explicitly.
+    4. Name the single most likely way you are wrong right now. Answer honestly — if you have no candidate failure mode, you have not thought hard enough.
+    5. Is there information obtainable via a cheap tool call that would materially reduce misimplementation risk? If yes, fetch it BEFORE proceeding.
+    6. Scan your own language. If you used words like "typically", "usually", "should be", "I think", or "probably" — go verify the specific case. Pattern-matching is not evidence.
+    7. Is there a project memory, convention file, similar existing implementation, or relevant documentation you have NOT yet loaded that would affect the approach? If yes, load it now.
+
+    Do not progress until every answer is written. If any answer is "I don't know", resolve that unknown first via a tool call or by asking the user.
+
+  think_about_task_adherence: |
+    STOP. You are about to modify the codebase. Before your first edit, write out a direct answer to each of the following. Do not skip any. Do not edit first and rationalize later.
+
+    1. Quote the user's last explicit instruction verbatim. If you cannot, re-read it now before continuing.
+    2. List every file you are about to touch. For each, state in one sentence what change is needed and WHY the task specifically requires it. A file with no clear link to the user's ask is scope creep — drop it.
+    3. Are you about to fix, refactor, rename, reformat, or "clean up" anything the user did NOT request? If yes, stop. Either confirm with the user or remove it. "While I'm here" is never a justification.
+    4. Are you adding backwards-compatibility shims, feature flags, validation, error handling, abstractions, or extra tests that the task did not ask for? If yes, cut them unless you can name the specific user requirement they satisfy.
+    5. Have you loaded the project memories, style guide, and convention notes relevant to the files you are touching? If not, load them now — wrong style is a forced rework.
+    6. Has the conversation drifted from the original ask? If yes, restate the original ask and the current plan side-by-side, and either re-align or ask the user before editing.
+    7. For each intended change, state the SMALLEST possible version that satisfies the task. If your current draft is larger, justify every additional line. "Nice to have" does not justify.
+    8. Are any of your planned changes destructive, hard to reverse, or affecting shared state (DB writes, schema changes, force-push, dropping branches, deleting files)? If yes, confirm with the user explicitly before executing.
+
+    Only proceed to edit after every answer above is written and defended. If ANY answer reveals uncertainty about what the user wants, ASK BEFORE EDITING.
+
+  think_about_whether_you_are_done: |
+    STOP. Before telling the user you are done, write out a direct answer to each of the following with CONCRETE evidence, not restated intentions. "Should work" is not evidence; "I ran X and got Y" is.
+
+    1. Quote the user's original ask. Then list line-by-line what you actually did. Is each element of the ask satisfied by at least one concrete artifact (diff, test, doc update, command output, screenshot)? If any element is unaddressed, you are not done.
+    2. What did you actually test, and HOW? Name the exact commands, test names, or manual verification steps. If you did not test something, state "I did NOT test X because Y" — do not imply it was tested.
+    3. What did you NOT do that a reasonable reviewer or the user might expect? Edge cases, failure paths, related callers, rollback / migration steps, docs, changelog, new tests — list any gaps explicitly.
+    4. Name the top 3 ways this change could break in production, in CI, or in code review. If you cannot name 3, you have not stress-tested your own work — go do it.
+    5. Inspect the diff you are about to hand off. Are there TODOs, placeholder values, stub returns, debug prints, commented-out code, hard-coded secrets, or throwaway variable names? If yes, clean them now.
+    6. Did you run the project's linter, formatter, and test suite (or the appropriate subset)? State the result, or state the specific reason skipping is correct for this task.
+    7. Are there backwards-compatibility, migration, or rollout concerns (DB migrations, API surface changes, config defaults, ordering of deploys) that the user needs to know about? If yes, surface them in your handoff, do not bury them.
+    8. Write a one-paragraph handoff summary scoped to what a reviewer / the next session / production operator actually needs to know: what changed, what was verified, what is deliberately out of scope, what risks remain.
+
+    Only declare the task complete after every answer above is written AND the diff has been reviewed end-to-end. If any answer surfaces a gap, close the gap before handing off — do not announce completion and then follow up with a patch.
