@@ -53,7 +53,13 @@ class SerenaAgentMode(ToolInclusionDefinition, ToStringMixin):
         """Print an overview of the mode."""
         print(f"{self.name}:\n {self.description}")
         if self.excluded_tools:
-            print(" excluded tools:\n  " + ", ".join(sorted(self.excluded_tools)))
+            print(" excluded tools:\n    " + ", ".join(sorted(self.excluded_tools)))
+        if self.included_optional_tools:
+            print(" included optional tools:\n    " + ", ".join(sorted(self.included_optional_tools)))
+        if self.fixed_tools:
+            print(" fixed tools:\n    " + ", ".join(sorted(self.fixed_tools)))
+        if self.prompt:
+            print(" defines initial prompt")
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> Self:
@@ -129,6 +135,12 @@ class SerenaAgentMode(ToolInclusionDefinition, ToStringMixin):
             raise FileNotFoundError(f"Mode file not found: {path.resolve()}")
 
         return cls.from_name(str(name_or_path))
+
+    def has_prompt(self) -> bool:
+        """
+        :return: whether this mode defines a prompt
+        """
+        return bool(self.prompt and self.prompt.strip())
 
 
 @dataclass(kw_only=True)

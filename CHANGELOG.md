@@ -3,11 +3,35 @@
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
 * General:
-  - Support environment variable `SERENA_USAGE_REPORTING` (set to `false` to disable usage reporting)
-  - Extended the list of always ignored directories (by language servers) with common cases.
-  - **Fix**: `search_for_pattern` (and any caller of `text_utils.search_text`) now returns 0-based
-    line numbers, matching every other Serena tool. Previously these results were 1-based.
-    The system prompt now states the 0-based convention explicitly.
+  - Support `serena --version` CLI command for displaying the current version #1347
+  - Fix: Check for ignored path ignored `.git` folder only at the top level, not in every subdirectory (`Project._is_ignored_relative_path`) #1350
+  - `GetSymbolsOverviewTool`: ignored paths were not respected in LSP variant (fix in `SolidLanguageServer`)
+  - Fix: Duplicate comments in re-saved YAML configuration files #1285
+  - Prompt provision improvements (project activation, initial instructions):
+     - Prompt provision is now session-aware, i.e. when using the MCP server in HTTP mode, prompts are provided for each session separately, 
+       ensuring that the necessary information is always provided to the LLM
+     - Fix: Prompts of dynamically activated modes (upon project activation) were not necessarily passed to the LLM (only in the system prompt via
+       `initial_instructions`). Now they are passed directly in the activation message (and excluded from a subsequent `initial_instructions` call).
+     - Fix: Project activation message was provided more than once for case of dynamic project activation followed
+       by `initial_instructions` #1372
+     - Always provide full activation message upon calling `activate_project` (even if project was already active in the same session) #1384
+       This is necessary, because some clients (e.g. Claude Desktop) will reuse a single session across chats.
+  - Security: Forbid `".."` in memory names to disallow accessing files outside dedicated memory directories
+  - Security: Add check for tool being read-only in the project server (previously only checked in `query_project` tool, i.e. client side)
+  - Usage reporting now also includes the name of the Serena context that is used 
+  - Fix: restricted `insert_after_symbol` to raise if used on an assignment or similar (can't reliably determine the symbol range)
+  - Fix: Failure to collect project ignore spec now logs the error and downstream tasks fail fast, fixing hanging LS initialisation
+  - Improve loading of `project.yml` files: Gracefully handle user errors involving incorrect use of None/empty instead of list
+  - Project server: 
+     - `query_project`: Support use of project root instead of project name #1388
+     - `list_queryable_projects`: Return both project names and project roots 
+  - Fix: `search_for_pattern` tool returned 1-based line numbers (in contrast to all other tools); cause: implementation of `text_utils.search_text`
+  - Serena's system prompt (a.k.a. the 'Serena Instructions Manual') is now provided lazily. 
+    At MCP connection time, only a one-sentence bootstrap prompt is provided.
+    The `initial_instructions` tool provides the full prompt on demand, keeping the initial context lean.
+  - Add `serena_info` tool for on-demand retrieval of usage information
+
+* Fork (ikarolaborda/serena) additions:
   - **New tool**: `search_memories` — substring or regex search across project + global memory
     contents with bounded snippets, optional tag filter, and per-tool output budgeting.
   - `write_memory` accepts an optional `tags` list which is serialized as a conservative
@@ -15,9 +39,46 @@ Status of the `main` branch. Changes prior to the next official version change w
     remain valid; `MemoriesManager.read_memory_metadata` exposes parsed `tags`/`type`/`description`.
   - Reactivated `find_file` and `list_dir` in the `codex`, `ide`, `vscode`, `antigravity`,
     and `jb-ai-assistant` contexts so semantic + symbolic search tools are discoverable
-    in those editors. `replace_content` remains excluded in `codex` (matches existing fork policy).
+    in those editors.
 
-JetBrains: 
+* JetBrains:
+  - Add `debug` tool: The agent can set breakpoints, inspect variables, evaluate expressions and control execution flow
+    by directly interacting with the IDE's debugger, using a REPL-style interface for maximum flexibility.  
+  - `move` and `safe_delete` tools: transform empty string to None (counteracts client errors)
+
+* Dependencies:
+  - `pywebview`: Switch back to official release (new version 6.2) #1253
+  - `mcp`: Update from `1.26.0` to `1.27.0`
+
+* Evaluations:
+  - Added new evaluations for Junie Plugin with Opus 4.6 and GLM 5.1 in Claude Code.
+
+* Language Servers:
+  - Fix: clangd capability checks now tolerate valid initialize response shape differences and invalidate cached C++ document symbols when clangd/compile commands context changes #1359                                                                                                                                                                                                            
+  - Fix: `rename_symbol` for Vue files now correctly propagates edits to the TypeScript server, enabling cross-file renames in `.vue` files 
+  - Fix: Lean4 stale cache — empty document symbol responses (returned before `lake build` completes) are no longer persisted, preventing symbols from being permanently hidden #1356
+  - Add JSON language server support via `vscode-json-languageserver` (experimental) #1391
+  - Fix: Elixir/Expert deadlock on startup — Expert's build pipeline requires a `textDocument/didOpen` notification to start; Serena now opens `mix.exs` immediately after `initialized` so Expert begins compiling instead of waiting indefinitely #1397
+
+Dashboard:
+  - Add configurable dashboard interface mode (new global configuration setting `web_dashboard_interface`):
+    Three modes (browser, native app with tray, tray manager for aggregating multiple instances) are supported, depending on the OS
+  - Fix: Memory leaks in frontend when using Chromium-based browsers/Windows webview #1389
+
+# v1.1.2 (2026-04-14)
+
+* General:
+  - Support environment variable `SERENA_USAGE_REPORTING` (set to `false` to disable usage reporting)
+  - Extended the list of always ignored directories (by language servers) with common cases.
+  - Improve exposed toolset: With mode switching no longer being a feature, we now fully apply tool exclusions 
+    defined by modes when in a single-project context (limiting exposed tools to a minimum)
+  - Fix: When scanning for `.gitignore` files, the presence of files that could not be made relative 
+    to the project root would cause the scan to fail. #1317
+
+* Dashboard:
+  - Fix handling of read news, saving each read news entry separately #1338
+
+* JetBrains: 
   - Improve handling of `relative_path` parameter 
      - Improve its documentation to avoid usage errors
      - Replace escaped characters in `relative_path` with their unescaped counterparts (&lt; and &gt;)
@@ -25,8 +86,9 @@ JetBrains:
 
 * Language Servers:
   - Add mSL (mIRC Scripting Language) support (custom pygls-based language server; symbols, references, definitions)
+  - Fix initialisation issues in Vue language server #1333
 
-# 1.1.1
+# v1.1.1 (2026-04-12)
 
 * General:
   - Enable cert verification for HTTPS request to oraios-software.de #1320
@@ -38,7 +100,7 @@ JetBrains:
   - Fix Dart LSP returning only symbol name as body instead of full method body.
 
 
-# 1.1.0
+# v1.1.0 (2026-04-11)
 
 * General:
   - **Major**: Add commands for hooks and documentation of recommended setup. Consider setting up the [recommended hooks](https://oraios.github.io/serena/02-usage/030_clients.html) !
@@ -61,7 +123,7 @@ JetBrains:
     Some clients would terminate the MCP server in a way that did not ensure proper termination.
   - Fix: Manual server shutdown triggered by GUI tool/dashboard not cleaning everything up.
 
-# 1.0.0
+# v1.0.0 (2026-04-03)
 
 * General:
     * Add monorepo/multi-language support
@@ -142,7 +204,7 @@ JetBrains:
   * **C/C++ alternate LS (ccls)**: Add experimental, opt-in support for ccls as an alternative backend to clangd. Enable via `cpp_ccls` in project configuration. Requires `ccls` installed and ideally a `compile_commands.json` at repo root.
   * **Add support for Solidity** via the Nomic Foundation `@nomicfoundation/solidity-language-server` (automatically installed via npm)
 
-# 0.1.4
+# v0.1.4 (2025-08-15)
 
 ## Summary
 
@@ -186,7 +248,7 @@ Fixes:
   default shell reconfiguration imposed by Claude Code)
 * Additional wait for initialization in C# language server before requesting references, allowing cross-file references to be found.
 
-# 0.1.3
+# v0.1.3 (2025-07-22)
 
 ## Summary
 

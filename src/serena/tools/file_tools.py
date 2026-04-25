@@ -347,7 +347,6 @@ class SearchForPatternTool(Tool):
             is used to further restrict the search).
             Smartly combining the various restrictions allows you to perform very targeted searches.
 
-
         :param substring_pattern: Regular expression for a substring pattern to search for
         :param context_lines_before: Number of lines of context to include before each match
         :param context_lines_after: Number of lines of context to include after each match
@@ -411,6 +410,7 @@ class SearchForPatternTool(Tool):
                 paths_include_glob=paths_include_glob,
                 paths_exclude_glob=paths_exclude_glob,
             )
+
         # group matches by file
         file_to_matches: dict[str, list[str]] = defaultdict(list)
         for match in matches:

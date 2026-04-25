@@ -86,7 +86,10 @@ class MemoriesManager:
 
     def get_memory_file_path(self, name: str) -> Path:
         # Strip .md extension if present
-        name = name.replace(".md", "")
+        name = name.replace(".md", "").replace(os.sep, "/")
+        parts = name.split("/")
+        if ".." in parts:
+            raise ValueError(f"Memory name cannot contain '..' segments for security reasons. Got: {name}")
 
         if self._is_global(name):
             if name == self.GLOBAL_TOPIC:
@@ -105,7 +108,7 @@ class MemoriesManager:
 
         # Project-local memory
         assert self._project_memory_dir is not None, "Project dir was not passed at initialization"
-        parts = name.split("/")
+
         filename = f"{parts[-1]}.md"
 
         if len(parts) > 1:
@@ -481,8 +484,8 @@ class Project(ToStringMixin):
                 f.write(f"/{ProjectConfig.SERENA_LOCAL_PROJECT_FILE}\n")
 
         # prepare ignore spec asynchronously, ensuring immediate project activation.
-        self.__ignored_patterns: list[str]
-        self.__ignore_spec: pathspec.PathSpec
+        self.__ignored_patterns: list[str] | None = None
+        self.__ignore_spec: pathspec.PathSpec | None = None
         self._ignore_spec_available = threading.Event()
         # Capture any exception raised during async gather so consumers can re-raise it instead
         # of deadlocking on a wait() that never unblocks.
@@ -654,7 +657,7 @@ class Project(ToStringMixin):
         rel_path = Path(relative_path)
 
         # always ignore paths inside .git
-        if len(rel_path.parts) > 0 and rel_path.parts[0] == ".git":
+        if len(rel_path.parts) > 0 and ".git" in rel_path.parts:
             return True
 
         return match_path(str(relative_path), self._ignore_spec, root_path=self.project_root)

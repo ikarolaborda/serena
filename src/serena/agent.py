@@ -7,16 +7,20 @@ import multiprocessing
 import os
 import platform
 import signal
-import subprocess
-import sys
+import threading
+from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from logging import Logger
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import requests
 import webview
 from sensai.util import logging
+from sensai.util.helper import mark_used
 from sensai.util.logging import LogTime
 from sensai.util.string import dict_string
 
@@ -33,7 +37,7 @@ from serena.config.serena_config import (
     SerenaPaths,
     ToolInclusionDefinition,
 )
-from serena.dashboard import SerenaDashboardAPI, SerenaDashboardViewer
+from serena.dashboard import SerenaDashboardAPI, SerenaDashboardTrayManager, SerenaDashboardViewer, open_url_in_browser
 from serena.ls_manager import LanguageServerManager
 from serena.project import MemoriesManager, Project
 from serena.prompt_factory import SerenaPromptFactory
@@ -197,52 +201,297 @@ class ToolSet:
 
 
 class ActiveModes:
+    _mode_instances: dict[str, SerenaAgentMode] = {}
+
     def __init__(self) -> None:
-        self._base_modes: Sequence[str] | None = None
-        self._default_modes: Sequence[str] | None = None
-        self._active_mode_names: Sequence[str] | None = []
-        self._active_modes: Sequence[SerenaAgentMode] | None = []
+        self._configured_base_modes: Sequence[str] | None = None
+        self._configured_default_modes: Sequence[str] | None = None
+        self._active_mode_names: Sequence[str] = []
 
     def apply(self, mode_selection: ModeSelectionDefinition) -> None:
-        # invalidate active modes
-        self._active_mode_names = None
-        self._active_modes = None
-
         # apply overrides
         log.debug("Applying mode selection: default_modes=%s, base_modes=%s", mode_selection.default_modes, mode_selection.base_modes)
         if mode_selection.base_modes is not None:
-            self._base_modes = mode_selection.base_modes
+            self._configured_base_modes = mode_selection.base_modes
         if mode_selection.default_modes is not None:
-            self._default_modes = mode_selection.default_modes
-        log.debug("Current mode selection: base_modes=%s, default_modes=%s", self._base_modes, self._default_modes)
+            self._configured_default_modes = mode_selection.default_modes
+        log.debug("Current mode selection: base_modes=%s, default_modes=%s", self._configured_base_modes, self._configured_default_modes)
+
+        self._active_mode_names = sorted(set(self._configured_base_modes or []) | set(self._configured_default_modes or []))
 
     def get_mode_names(self) -> Sequence[str]:
-        if self._active_mode_names is not None:
-            return self._active_mode_names
-        active_mode_names: set[str] = set()
-        if self._base_modes is not None:
-            active_mode_names.update(self._base_modes)
-        if self._default_modes is not None:
-            active_mode_names.update(self._default_modes)
-        self._active_mode_names = sorted(active_mode_names)
-        log.info("Active modes: %s", self._active_mode_names)
         return self._active_mode_names
 
-    def get_modes(self) -> Sequence[SerenaAgentMode]:
-        if self._active_modes is not None:
-            return self._active_modes
-        self._active_modes = []
-        for mode_name in self.get_mode_names():
-            mode = SerenaAgentMode.load(mode_name)
-            self._active_modes.append(mode)
-        return self._active_modes
+    @classmethod
+    def get_mode_instance(cls, mode_name: str) -> SerenaAgentMode:
+        if mode_name not in cls._mode_instances:
+            cls._mode_instances[mode_name] = SerenaAgentMode.load(mode_name)
+        return cls._mode_instances[mode_name]
 
-    # TODO: apply caching like in get_modes
+    def get_modes(self) -> Sequence[SerenaAgentMode]:
+        return [self.get_mode_instance(mode_name) for mode_name in self._active_mode_names]
+
     def get_default_modes(self) -> Sequence[SerenaAgentMode]:
-        return [SerenaAgentMode.load(mode_name) for mode_name in self._default_modes or []]
+        return [self.get_mode_instance(mode_name) for mode_name in self._configured_default_modes or []]
 
     def get_base_modes(self) -> Sequence[SerenaAgentMode]:
-        return [SerenaAgentMode.load(mode_name) for mode_name in self._base_modes or []]
+        return [self.get_mode_instance(mode_name) for mode_name in self._configured_base_modes or []]
+
+
+class ProjectPromptProvisionStatus:
+    """
+    Manages the status of the provision of project-specific prompts
+    """
+
+    @dataclass
+    class SessionStatus:
+        mode_prompts_provided: bool = False
+        project_activation_message_provided: bool = False
+
+    def __init__(self, newly_activated_mode_names: set[str] | None = None):
+        """
+        :param newly_activated_mode_names: list of mode names that have been newly activated (by dynamic project activation)
+            and for which prompts must still be provided (either in the system prompt or via the activation message)
+        """
+        if newly_activated_mode_names is None:
+            newly_activated_mode_names = set()
+        self._newly_activated_mode_names: set[str] = newly_activated_mode_names
+        self._session_status_dict: dict[str, ProjectPromptProvisionStatus.SessionStatus] = defaultdict(lambda: self.SessionStatus())
+
+    def _get_session_status(self, session_id: str) -> SessionStatus:
+        return self._session_status_dict[session_id]
+
+    def is_mode_prompt_already_provided(self, mode_name: str, session_id: str) -> bool:
+        """
+        :param mode_name: the mode name
+        :param session_id: the client session ID
+        :return: whether the mode name was already provided (in a project-specific activation message) and therefore
+            should not be included again (in the Serena instructions manual)
+        """
+        if not self._get_session_status(session_id).mode_prompts_provided:
+            return False
+        return mode_name in self._newly_activated_mode_names
+
+    def get_modes_with_prompts_to_be_provided_for_project_activation(self, session_id: str) -> list[SerenaAgentMode]:
+        """
+        Gets the modes that have been newly activated and for which prompts still need to be provided
+        (in dynamic project activation message).
+
+        :param: session_id: the client session ID
+        :return: the modes
+        """
+        result = []
+
+        # Note: We always want to provide the prompts of newly activated modes in the activation message
+        #   because some clients (e.g. Claude Desktop) use a single session for all chats.
+        #   Therefore, we view project activation as an "entry action", which must always provide
+        #   all the information that is relevant to the project
+        # Because of this, we cannot use a condition like this:
+        #   new_mode_prompts_must_be_provided_for_activation = not self._get_session_status(session_id).mode_prompts_provided
+        new_mode_prompts_must_be_provided_for_activation = True
+        mark_used(session_id)
+
+        if new_mode_prompts_must_be_provided_for_activation:
+            for mode_name in self._newly_activated_mode_names:
+                mode = ActiveModes.get_mode_instance(mode_name)
+                if mode.has_prompt():
+                    result.append(mode)
+        return result
+
+    def mark_mode_prompts_as_provided(self, session_id: str) -> None:
+        """
+        Marks the prompts for all newly activated modes as provided, so that they will not be included in the project activation message.
+
+        :param session_id: the client session ID
+        """
+        self._get_session_status(session_id).mode_prompts_provided = True
+
+    def mark_project_activation_message_as_provided(self, session_id: str) -> None:
+        """
+        Marks the project activation message as provided, so that it will not be included again in case of multiple activations of the same project.
+
+        :param session_id: the client session ID
+        """
+        self._get_session_status(session_id).project_activation_message_provided = True
+
+    def is_project_activation_message_already_provided(self, session_id: str) -> bool:
+        """
+        :param session_id: the client session ID
+        :return: whether the project activation message was already provided and therefore should not be included again
+        """
+        return self._get_session_status(session_id).project_activation_message_provided
+
+
+class DashboardManager:
+    class Mode(Enum):
+        BROWSER = "browser"
+        """
+        Open the dashboard in the default browser; supported on all platforms.
+        """
+        WEBVIEW = "app"
+        """
+        Open the dashboard via a native window (using pywebview) which minimises to the tray;
+        supported on Windows and macOS (but on macOS, tray apps for multiple instances accumulate 
+        in the top bar, which users may not want)
+        """
+        TRAY_MANAGER = "tray_manager"
+        """
+        Register dashboard instance with a central manager tray app (single tray icon for all instances), 
+        spawning the tray manager if not already running; supported on macOS and Windows.
+        """
+
+        @classmethod
+        def from_platform(cls) -> "DashboardManager.Mode":
+            match platform.system():
+                case "Windows":
+                    return cls.WEBVIEW
+                case "Darwin":
+                    # TODO: Switch to TRAY_MANAGER once support is tested
+                    return cls.BROWSER
+                case _:
+                    return cls.BROWSER
+
+        def is_supported(self) -> bool:
+            """
+            :return: whether the mode is supported on the current platform
+            """
+            if self == DashboardManager.Mode.WEBVIEW:
+                return SerenaDashboardViewer.is_current_platform_supported()
+            elif self == DashboardManager.Mode.TRAY_MANAGER:
+                return SerenaDashboardTrayManager.is_current_platform_supported()
+            else:
+                return True
+
+    def __init__(
+        self,
+        port: int,
+        host_listen_address: str,
+        open_dashboard_on_launch: bool,
+        active_project: Project | None = None,
+        mode_str: str | None = None,
+    ):
+        # determine requested mode
+        if mode_str is not None:
+            try:
+                mode = self.Mode(mode_str)
+            except ValueError:
+                mode = self.Mode.from_platform()
+                log.warning(f"Invalid dashboard interface mode '{mode_str}' specified; falling back to platform default '{mode.value}'.")
+        else:
+            mode = self.Mode.from_platform()
+
+        # check for mode compatibility
+        if not mode.is_supported():
+            fallback_mode = self.Mode.from_platform()
+            log.warning(
+                f"Dashboard interface mode '{mode.value}' is not supported on the current platform; "
+                "falling back to '{fallback_mode.value}'."
+            )
+            mode = fallback_mode
+
+        self._port = port
+        self._mode = mode
+        self._dashboard_viewer_process: multiprocessing.Process | None = None
+        self._tray_manager_lock = threading.Lock()
+
+        dashboard_host = host_listen_address
+        if dashboard_host == "0.0.0.0":
+            dashboard_host = "localhost"
+        self.url = f"http://{dashboard_host}:{port}/dashboard/index.html"
+
+        # handle startup
+        match self._mode:
+            case self.Mode.WEBVIEW:
+                self._start_dashboard_viewer(minimized=not open_dashboard_on_launch)
+            case self.Mode.TRAY_MANAGER:
+                init_fn = lambda: self._tray_manager_register(open_on_launch=open_dashboard_on_launch, active_project=active_project)
+                threading.Thread(target=init_fn, name="init-DashboardTrayManager", daemon=True).start()
+            case self.Mode.BROWSER:
+                if open_dashboard_on_launch:
+                    if not system_has_usable_display():
+                        log.info("Not opening the Serena dashboard because no usable display was detected.")
+                    else:
+                        self.open_dashboard_in_browser()
+
+    def open_dashboard_in_browser(self) -> None:
+        open_url_in_browser(self.url, use_subprocess=True)
+
+    @staticmethod
+    def _start_dashboard_viewer_process_function(url: str, minimized: bool, parent_process_id: int) -> None:
+        """
+        Main function of the subprocess for starting the dashboard viewer
+        """
+        try:
+            SerenaDashboardViewer(url, start_minimized=minimized, parent_process_id=parent_process_id).run()
+        except webview.errors.WebViewException as e:
+            log.warning(f"Could not open Serena Dashboard viewer. Cause:\n{e}")
+            # Fall back to opening the browser window if the window was supposed to be shown directly
+            if not minimized:
+                open_url_in_browser(url, use_subprocess=True)
+
+    def _start_dashboard_viewer(self, minimized: bool) -> None:
+        """
+        Starts the dashboard viewer (in a separate process) or, if the current platform does not support it,
+        opens the dashboard in the default web browser.
+
+        :param minimized: whether the dashboard viewer should be started minimized (if supported on the current platform).
+            If the viewer is not supported on the current platform, then this controls whether to open the browser window.
+        """
+        self._dashboard_viewer_process = multiprocessing.Process(
+            target=self._start_dashboard_viewer_process_function, args=(self.url, minimized, os.getpid()), daemon=True
+        )
+        self._dashboard_viewer_process.start()
+
+    def _tray_manager_register(self, open_on_launch: bool, active_project: Project | None) -> None:
+        """
+        Ensure the tray manager is running and register this dashboard instance with it.
+
+        If the current platform supports the native tray manager, this method starts
+        the manager (if not already running) and registers the instance. Otherwise,
+        it falls back to opening the dashboard in the default web browser.
+
+        :param open_on_launch: whether the dashboard should be opened immediately
+        """
+        with LogTime("Dashboard tray manager initialisation"):
+            with self._tray_manager_lock:
+                # ensure the singleton tray manager process is running
+                SerenaDashboardTrayManager.ensure_running()
+
+                # determine the current project name (if any)
+                project_name = active_project.project_name if active_project is not None else None
+
+                # register this instance with the tray manager
+                SerenaDashboardTrayManager.register_instance(
+                    port=self._port,
+                    dashboard_url=self.url,
+                    project=project_name,
+                    started_at=datetime.now().isoformat(timespec="seconds"),
+                    open_viewer=open_on_launch,
+                )
+
+    def shutdown(self) -> None:
+        """
+        Frees resources, terminating the dashboard viewer process (if any) and unregistering from the tray manager (if applicable).
+        """
+        if self._dashboard_viewer_process is not None:
+            log.info("Stopping the dashboard viewer process ...")
+            self._dashboard_viewer_process.terminate()
+            self._dashboard_viewer_process = None
+
+        if self._mode == self.Mode.TRAY_MANAGER:
+            with self._tray_manager_lock:
+                SerenaDashboardTrayManager.unregister_instance(port=self._port)
+
+    def update_active_project(self, active_project: Project | None) -> None:
+        """
+        Updates the active project (where applicable).
+
+        :param active_project: the currently active project or None if no project is active
+        """
+        if self._mode == self.Mode.TRAY_MANAGER:
+            with self._tray_manager_lock:
+                project_name = active_project.project_name if active_project is not None else None
+                SerenaDashboardTrayManager.update_project(port=self._port, project=project_name)
 
 
 class SerenaAgent:
@@ -268,9 +517,11 @@ class SerenaAgent:
             if necessary.
         """
         self._active_project: Project | None = None
+        self._project_activation_callback = project_activation_callback
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
-        self._dashboard_viewer_process: multiprocessing.Process | None = None
-
+        self._dashboard_manager: DashboardManager | None = None
+        self._project_prompt_status = ProjectPromptProvisionStatus()
+        self._mode_overrides = modes
         self.version = serena_version()
 
         # obtain serena configuration using the decoupled factory function
@@ -279,13 +530,14 @@ class SerenaAgent:
         # propagate configuration to other components
         self.serena_config.propagate_settings()
 
+        # initialise active modes (baseline modes prior to project activation)
+        self._active_modes: ActiveModes
+        self._update_active_modes(log_message=False)
+
         # determine registered project to be activated (if any)
         registered_project_to_activate: RegisteredProject | None = (
             self.serena_config.get_registered_project(project, autoregister=True) if project is not None else None
         )
-
-        # dashboard URL (set when dashboard is started)
-        self._dashboard_url: str | None = None
 
         # adjust log level
         serena_log_level = self.serena_config.log_level
@@ -364,13 +616,10 @@ class SerenaAgent:
 
         # Initialize the prompt factory
         self.prompt_factory = SerenaPromptFactory()
-        self._project_activation_callback = project_activation_callback
 
         # activate the given project (if any), also updating the active modes
         # Note: We cannot update the active tools yet, because the base toolset has not been computed yet
         #       (and its computation depends on the active project)
-        self._active_modes: ActiveModes
-        self._mode_overrides = modes
         if project is not None:
             try:
                 self.activate_project_from_path_or_name(project, update_active_modes=False, update_active_tools=False)
@@ -396,16 +645,17 @@ class SerenaAgent:
             self._dashboard_thread, port = SerenaDashboardAPI(
                 get_memory_log_handler(), tool_names, agent=self, tool_usage_stats=self._tool_usage_stats
             ).run_in_thread(host=self.serena_config.web_dashboard_listen_address)
-            dashboard_host = self.serena_config.web_dashboard_listen_address
-            if dashboard_host == "0.0.0.0":
-                dashboard_host = "localhost"
-            dashboard_url = f"http://{dashboard_host}:{port}/dashboard/index.html"
-            self._dashboard_url = dashboard_url
-            log.info("Serena web dashboard started at %s", dashboard_url)
-            self._start_dashboard_viewer(minimized=not self.serena_config.web_dashboard_open_on_launch)
+            self._dashboard_manager = DashboardManager(
+                port,
+                self.serena_config.web_dashboard_listen_address,
+                self.serena_config.web_dashboard_open_on_launch,
+                self._active_project,
+                mode_str=self.serena_config.web_dashboard_interface,
+            )
+            log.info("Serena web dashboard started at %s", self._dashboard_manager.url)
             # inform the GUI window (if any)
             if self._gui_log_viewer is not None:
-                self._gui_log_viewer.set_dashboard_url(dashboard_url)
+                self._gui_log_viewer.set_dashboard_url(self._dashboard_manager.url)
 
         self._send_usage_info()
 
@@ -417,6 +667,7 @@ class SerenaAgent:
             "dashboard": int(self.serena_config.web_dashboard),
             "version": self.version,
             "backend": self._language_backend.value,
+            "context": self._context.name,
         }
         try:
             requests.get("https://oraios-software.de/serena_usage.php", params=params, timeout=1)
@@ -453,31 +704,35 @@ class SerenaAgent:
         tool_inclusion_definitions.append(serena_config)
         tool_inclusion_definitions.append(context)
 
+        # determine whether we are operating in a single-project context
+        # (i.e. the project that is activated at startup is the only project that will be worked with throughout the session)
+        is_single_project = context.single_project and project is not None
+
         # consider modes
-        # Since modes can be dynamically turned on and off, we don't include their definitions directly,
-        # For the initially active dynamic modes, we make sure that the tools they enable are included.
-        for mode in modes.get_default_modes():
-            tool_inclusion_definitions.append(
-                NamedToolInclusionDefinition(
-                    name=f"InitialDynamicModeInclusions[{mode.name}]", included_optional_tools=mode.included_optional_tools
-                )
-            )
-        # For the base modes, we also apply the tool exclusions, since they apply throughout the entire session
+        # * base modes: These cannot be changed, so they are fully applied
         for base_mode in modes.get_base_modes():
-            tool_inclusion_definitions.append(
-                NamedToolInclusionDefinition(
-                    name=f"BaseMode[{base_mode.name}]",
-                    included_optional_tools=base_mode.included_optional_tools,
-                    excluded_tools=base_mode.excluded_tools,
+            tool_inclusion_definitions.append(base_mode)
+        # * default modes: When not in a single-project context, these modes are dynamic (can later be turned off),
+        #   so we consider only their inclusions (but not their exclusions, because these must not be hard)
+        for mode in modes.get_default_modes():
+            if is_single_project:
+                tool_inclusion_definitions.append(mode)
+            else:
+                # Since modes can be dynamically turned on and off, we don't include their definitions directly,
+                # For the initially active dynamic modes, we make sure that the tools they enable are included.
+                tool_inclusion_definitions.append(
+                    NamedToolInclusionDefinition(
+                        name=f"InitialDynamicModeInclusions[{mode.name}]", included_optional_tools=mode.included_optional_tools
+                    )
                 )
-            )
 
         # When in a single-project context, the agent is assumed to work on a single project, and we thus
         # want to apply that project's tool exclusions/inclusions from the get-go, limiting the set
         # of tools that will be exposed to the client.
         # Furthermore, we disable tools that are only relevant for project activation.
         # So if the project exists, we apply all the aforementioned exclusions.
-        if context.single_project and project is not None:
+        if is_single_project:
+            assert project is not None
             log.info(
                 "Applying tool inclusion/exclusion definitions for single-project context based on project '%s'",
                 project.project_name,
@@ -568,44 +823,9 @@ class SerenaAgent:
         """
         :return: the URL of the web dashboard, or None if the dashboard is not running
         """
-        return self._dashboard_url
-
-    @staticmethod
-    def _start_dashboard_viewer_process_function(url: str, minimized: bool, parent_process_id: int) -> None:
-        """
-        Main function of the subprocess for starting the dashboard viewer
-        """
-        try:
-            SerenaDashboardViewer(url, start_minimized=minimized, parent_process_id=parent_process_id).run()
-        except webview.errors.WebViewException as e:
-            log.warning(f"Could not open Serena Dashboard viewer. Cause:\n{e}")
-            # Fall back to opening the browser window if the window was supposed to be shown directly
-            if not minimized:
-                SerenaAgent._open_dashboard_in_browser(url)
-
-    def _start_dashboard_viewer(self, minimized: bool) -> None:
-        """
-        Starts the dashboard viewer (in a separate process) or, if the current platform does not support it,
-        opens the dashboard in the default web browser.
-
-        :param minimized: whether the dashboard viewer should be started minimized (if supported on the current platform).
-            If the viewer is not supported on the current platform, then this controls whether to open the browser window.
-        """
-        if not system_has_usable_display():
-            log.info("Not starting the Serena dashboard viewer because no usable display was detected.")
-            return
-
-        url = self.get_dashboard_url()
-        assert url is not None
-        if SerenaDashboardViewer.is_current_platform_supported():
-            self._dashboard_viewer_process = multiprocessing.Process(
-                target=self._start_dashboard_viewer_process_function, args=(url, minimized, os.getpid()), daemon=True
-            )
-            self._dashboard_viewer_process.start()
-        else:
-            log.info("Not starting Serena dashboard viewer because the current platform does not support it; using browser-based fallback")
-            if not minimized:
-                self._open_dashboard_in_browser(url)
+        if self._dashboard_manager is None:
+            return None
+        return self._dashboard_manager.url
 
     def open_dashboard(self) -> bool:
         """
@@ -613,26 +833,15 @@ class SerenaAgent:
 
         :return: True if the dashboard was opened, False if it could not be opened
         """
-        if self._dashboard_url is None:
+        if self._dashboard_manager is None:
             raise Exception("Dashboard is not running.")
 
         if not system_has_usable_display():
             log.warning("Not opening the Serena web dashboard because no usable display was detected.")
             return False
 
-        self._open_dashboard_in_browser(self._dashboard_url)
+        self._dashboard_manager.open_dashboard_in_browser()
         return True
-
-    @staticmethod
-    def _open_dashboard_in_browser(url: str) -> None:
-        # Use a subprocess to avoid any output from webbrowser.open being written to stdout
-        subprocess.Popen(
-            [sys.executable, "-c", f"import webbrowser; webbrowser.open({url!r})"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=False,
-        )
 
     def get_exposed_tool_instances(self) -> list["Tool"]:
         """
@@ -682,7 +891,21 @@ class SerenaAgent:
         template = JinjaTemplate(prompt_template)
         return template.render(available_tools=self._exposed_tools.tool_names, available_markers=self._exposed_tools.tool_marker_names)
 
-    def create_system_prompt(self) -> str:
+    def create_connection_prompt(self) -> str:
+        """
+        Returns the bootstrap prompt to be sent at MCP connection time.
+
+        :return: the prompt
+        """
+        return self.prompt_factory.create_connection_prompt()
+
+    def create_system_prompt(self, session_id: str = "global") -> str:
+        """
+        Returns the 'Serena Instructions Manual', i.e. Serena's system prompt.
+
+        :param session_id: the client session ID for the case where this is run from a tool; "global" for the connection time case
+        :return: the prompt
+        """
         available_tools = self._active_tools
         available_markers = available_tools.tool_marker_names
         global_memories = MemoriesManager(
@@ -690,28 +913,47 @@ class SerenaAgent:
         ).list_global_memories()
         global_memories_str = dict_string(global_memories.to_dict()) if len(global_memories) > 0 else ""
         log.info("Generating system prompt with available_tools=(see active tools), available_markers=%s", available_markers)
+
+        # determine modes for which prompts must (still) be provided, excluding modes that were already provided in a
+        # previously provided project activation message (if any)
+        relevant_modes = []
+        for mode in self.get_active_modes():
+            if mode.has_prompt():
+                if not self._project_prompt_status.is_mode_prompt_already_provided(mode.name, session_id):
+                    relevant_modes.append(mode)
+        self._project_prompt_status.mark_mode_prompts_as_provided(session_id)
+
         system_prompt = self.prompt_factory.create_system_prompt(
             context_system_prompt=self._format_prompt(self._context.prompt),
-            mode_system_prompts=[self._format_prompt(mode.prompt) for mode in self.get_active_modes()],
+            mode_system_prompts=[self._format_prompt(mode.prompt) for mode in relevant_modes],
             available_tools=available_tools.tool_names,
             available_markers=available_markers,
             global_memories_list=global_memories_str,
         )
 
-        # If a project is active at startup, append its activation message
-        if self._active_project is not None:
-            system_prompt += "\n\n" + self.get_project_activation_message()
+        # provide the project activation message if it hasn't yet been provided
+        if self._active_project is not None and not self._project_prompt_status.is_project_activation_message_already_provided(session_id):
+            system_prompt += "\n\n" + self.get_project_activation_message(session_id)
 
-        log.info("System prompt:\n%s", system_prompt)
         return system_prompt
 
-    def get_project_activation_message(self) -> str:
+    def get_project_activation_message(self, session_id: str) -> str:
         """
         :return: a message providing information about the project upon activation (e.g. programming language, memories, initial prompt)
         :raise: AssertionError if no project is active
         """
         proj = self._active_project
         assert proj is not None, "A project must be active before calling this."
+
+        # Note: The activation message is always returned in full, even if it was already provided in the current session,
+        #   because some clients (e.g. Claude Desktop) will use the same session across multiple chats.
+        #   So while we don't want the activation message to be additionally included in the system prompt
+        #   (initial_instructions), an explicit project activation should always return it.
+        # (The check below deliberately left in place for documentation purposes, preventing a regression)
+        if self._project_prompt_status.is_project_activation_message_already_provided(session_id):
+            pass  # no special handling
+
+        # provide basic project information (name, location, languages, encoding)
         if proj.is_newly_created:
             msg = f"Created and activated a new project with name '{proj.project_name}' at {proj.project_root}. "
         else:
@@ -721,6 +963,7 @@ class SerenaAgent:
             msg += f"\nProgramming languages: {languages_str}."
         msg += f"File encoding: {proj.project_config.encoding}."
 
+        # add list of memories (if memories are enabled)
         include_memories = self._active_tools.contains_tool_class(ReadMemoryTool)
         if include_memories:
             project_memories = proj.memories_manager.list_project_memories()
@@ -729,11 +972,24 @@ class SerenaAgent:
                     f"\n{json.dumps(project_memories.to_dict())}\n"
                     + "Use the `read_memory` tool to read these memories later if they are relevant to the task."
                 )
+
+        # add prompts for modes that were dynamically activated by the project
+        modes_with_prompts = self._project_prompt_status.get_modes_with_prompts_to_be_provided_for_project_activation(session_id)
+        if modes_with_prompts:
+            msg += "\nNewly applicable mode instructions:"
+            for mode in modes_with_prompts:
+                msg += f"\n{mode.prompt}"
+        self._project_prompt_status.mark_mode_prompts_as_provided(session_id)
+
+        # add project-specific prompt
         if proj.project_config.initial_prompt:
-            msg += f"\nAdditional project-specific instructions:\n {proj.project_config.initial_prompt}"
+            msg += f"\nProject-specific instructions:\n {proj.project_config.initial_prompt}"
+
+        self._project_prompt_status.mark_project_activation_message_as_provided(session_id)
+
         return msg
 
-    def _update_active_modes(self) -> None:
+    def _update_active_modes(self, log_message: bool = True) -> None:
         """
         Updates the active modes based on the Serena configuration, the active project configuration (if any),
         and mode overrides (if any).
@@ -744,6 +1000,9 @@ class SerenaAgent:
             self._active_modes.apply(self._active_project.project_config)
         if self._mode_overrides:
             self._active_modes.apply(self._mode_overrides)
+        if log_message:
+            active_mode_names = self._active_modes.get_mode_names()
+            log.info(f"Active modes ({len(active_mode_names)}): {', '.join(active_mode_names)}")
 
     def _update_active_tools(self) -> None:
         """
@@ -835,7 +1094,13 @@ class SerenaAgent:
         project.set_agent(self)
 
         if update_active_modes:
+            active_mode_names_before = set(self._active_modes.get_mode_names())
             self._update_active_modes()
+            newly_activated_mode_names = set(self._active_modes.get_mode_names()) - active_mode_names_before
+        else:
+            newly_activated_mode_names = None
+
+        self._project_prompt_status = ProjectPromptProvisionStatus(newly_activated_mode_names=newly_activated_mode_names)
 
         if update_active_tools:
             self._update_active_tools()
@@ -857,6 +1122,10 @@ class SerenaAgent:
 
         if self._project_activation_callback is not None:
             self._project_activation_callback()
+
+        # notify the dashboard manager of the project change (if applicable)
+        if self._dashboard_manager:
+            self._dashboard_manager.update_active_project(self._active_project)
 
         return True
 
@@ -1001,10 +1270,9 @@ class SerenaAgent:
             log.info("Stopping the GUI log window ...")
             self._gui_log_viewer.stop()
             self._gui_log_viewer = None
-        if self._dashboard_viewer_process:
-            log.info("Stopping the dashboard viewer process ...")
-            self._dashboard_viewer_process.terminate()
-            self._dashboard_viewer_process = None
+        if self._dashboard_manager:
+            self._dashboard_manager.shutdown()
+            self._dashboard_manager = None
 
     def shutdown(self) -> None:
         """

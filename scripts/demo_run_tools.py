@@ -24,7 +24,7 @@ if __name__ == "__main__":
     serena_config = SerenaConfig.from_config_file()
     serena_config.web_dashboard = False
     # project = Path(REPO_ROOT).parent / "serena-jetbrains-plugin-copy"
-    project = Path(REPO_ROOT) / "test/resources/repos/python/test_repo"
+    project = Path(REPO_ROOT)
     agent = SerenaAgent(project=str(project), serena_config=serena_config)
 
     # apply a tool
@@ -37,10 +37,11 @@ if __name__ == "__main__":
     inline_symbol = agent.get_tool(JetBrainsInlineSymbol)
 
     result = agent.execute_task(
-        lambda: inline_symbol.apply(
-            relative_path="test_repo/nested.py",
-            name_path="OuterClass/NestedClass",
-            keep_definition=True,
+        lambda: overview_tool.apply(
+            # name_path_pattern="SerenaAgent",
+            relative_path="src/serena/agent.py",
+            depth=2,
+            # keep_definition=True,
         )
     )
     pprint(json.loads(result))

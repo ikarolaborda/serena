@@ -14,7 +14,7 @@
 <br>
 
 
-* Serena provides essential **semantic code retrieval, editing and refactoring tools** that are akin to an IDE's capabilities,
+* Serena provides essential **semantic code retrieval, editing, refactoring and debugging tools** that are akin to an IDE's capabilities,
   operating at the symbol level and exploiting relational structure.
 * It integrates with any client/LLM via the model context protocol (**MCP**).
   
@@ -28,6 +28,12 @@ more complex codebases.
 > Do not install Serena via an MCP or plugin marketplace! They contain outdated and suboptimal installation commands. 
 > Instead, follow our [Quick Start](#quick-start) instructions.
 
+## Quick Demo
+
+https://github.com/user-attachments/assets/8d11646e-b80e-4723-b9d7-32d6101b5f58
+
+:tv: Longer video: [Introduction to Serena in 5 Minutes (YouTube)](https://www.youtube.com/watch?v=5QN7gN1KYLA)
+
 ## What Our "End Users" Say
 
 While it is humans who download and set up Serena, our end users are essentially AI agents.
@@ -35,22 +41,28 @@ As the ones actually applying Serena's tools, they are in the best position to e
 
 We crafted an unbiased evaluation prompt that leads the agent to perform ~20 routine coding tasks, 
 representative of everyday development work, 
-in order to compare Serena's tools with its own built-ins, measure the differences, and report the results. 
+in order to estimate the value added by Serena's tools when used alongside its own built-ins. 
 
 Here's a one-sentence summary of what the agents had to say:
 
-**Opus 4.6 (high effort) in Claude Code on a large Python codebase:**
-> "Serena's IDE-backed semantic tools are the single most impactful addition to my toolkit — cross-file renames, moves, and reference lookups that
+**Opus 4.6 (high) in Claude Code on a large Python codebase:**
+> "Serena's IDE-backed semantic tools are the single most impactful addition to my toolkit – cross-file renames, moves, and reference lookups that
 would cost me 8–12 careful, error-prone steps collapse into one atomic call, and I would absolutely ask any developer I work with to set them up."
 
 **GPT 5.4 (high) in Codex CLI on a Java codebase:**
 > "As a coding AI agent, I would ask my owner to add Serena because it gives me the missing IDE-level understanding of symbols, references, and
 refactorings, turning fragile text surgery into calmer, faster, more confident code changes where semantics matter."
 
-Give your agent the tools it has been asking for and add Serena MCP to your client!
+**GPT 5.4 (medium) in Copilot CLI on a large, multi-language monorepo:**
+> "As a coding agent, I’d absolutely ask my owner to add Serena because it makes me noticeably sharper and calmer on
+real code – especially symbol-aware navigation, cross-file refactors, and monorepo dependency jumps – while I still lean
+on built-ins for tiny text edits and non-code work."
 
-See our [documentation](https://oraios.github.io/serena/04-evaluation/000_evaluation-intro.html) for the full methodology and much more detailed evaluation results
-beyond these brief summaries, or run your own evaluation on a project of your choice.
+Different agents in different settings independently converge on the same verdict.
+
+_Give your agent the tools it has been asking for and add Serena MCP to your client!_
+
+See our [documentation](https://oraios.github.io/serena/04-evaluation/000_evaluation-intro.html) for the full methodology and much more detailed evaluation results, or run your own evaluation on a project of your choice.
  
 
 ## How Serena Works
@@ -61,10 +73,12 @@ but an LLM is required to do the actual work, orchestrating tool use.
 Serena can extend the functionality of your existing AI client via the **model context protocol (MCP)**.
 Most modern AI chat clients directly support MCP, including
 * terminal-based clients like Claude Code, Codex, OpenCode, or Gemini-CLI,
-* IDEs and IDE assistant plugins for VSCode, Cursor and JetBrains IDEs,
-* desktop and web clients like Claude Desktop or OpenWebUI.
+* IDEs and IDE assistant plugins for VSCode, Cursor and JetBrains IDEs (Copilot, Junie, JetBrains AI Assistant, etc.),
+* desktop and web clients like Claude Desktop, Codex App, or OpenWebUI.
 
 <img src="resources/serena-block-diagram.svg">
+
+:tv: See also: [Introduction to Serena in 5 Minutes (YouTube)](https://www.youtube.com/watch?v=5QN7gN1KYLA)
 
 To connect the Serena MCP server to your client, you either
   * provide the client with a launch command that allows it to start the MCP server, or
@@ -85,7 +99,7 @@ There are two alternative technologies powering these capabilities:
 
 * **Language servers** implementing the language server protocol (LSP) — the free/open-source alternative 
   which is used by default.
-* The **Serena JetBrains Plugin**, which leverages the powerful code analysis and editing
+* **The Serena JetBrains Plugin**, which leverages the powerful code analysis and editing
   capabilities of your JetBrains IDE (paid plugin; free trial available).
 
 You can choose either of these backends depending on your preferences and requirements.
@@ -96,7 +110,7 @@ Serena incorporates a powerful abstraction layer for the integration of language
 The underlying language servers are typically open-source projects or at least freely available for use.
 
 When using Serena's language server backend, we provide **support for over 40 programming languages**, including
-AL, Ansible, Bash, C#, C/C++, Clojure, Crystal, Dart, Elixir, Elm, Erlang, Fortran, F#, GLSL, Go, Groovy, Haskell, Haxe, HLSL, Java, JavaScript, Julia, Kotlin, Lean 4, Lua, Luau, Markdown, MATLAB, mSL, Nix, OCaml, Perl, PHP, PowerShell, Python, R, Ruby, Rust, Scala, Solidity, Swift, TOML, TypeScript, WGSL, YAML, and Zig.
+AL, Ansible, Bash, C#, C/C++, Clojure, Crystal, Dart, Elixir, Elm, Erlang, Fortran, F#, GLSL, Go, Groovy, Haskell, Haxe, HLSL, Java, JavaScript, JSON, Julia, Kotlin, Lean 4, Lua, Luau, Markdown, MATLAB, mSL, Nix, OCaml, Perl, PHP, PowerShell, Python, R, Ruby, Rust, Scala, Solidity, Swift, TOML, TypeScript, WGSL, YAML, and Zig.
 
 ### The Serena JetBrains Plugin
 
@@ -157,6 +171,12 @@ Serena's symbolic editing tools are less error-prone and much more token-efficie
 | insert before symbol   | yes               | yes              |
 | safe delete            | yes               | yes              |
 
+### Interactive Debugging
+
+Exclusive to the JetBrains plugin, Serena supports a highly general debugging tool,
+which allows an agent to set breakpoints, inspect variables, evaluate expressions and control execution flow 
+via a persistent REPL-style interface.
+
 ### Basic Features
 
 Beyond its semantic capabilities, Serena includes a set of basic utilities for completeness.
@@ -189,25 +209,6 @@ To achieve this, Serena offers multiple levels of (composable) configuration:
 * execution context-specific configuration (e.g. for particular clients)
 * dynamically composable configuration fragments (modes)
 
-</details>
-
-## Serena in Action
-
-<details>
-<summary>Demonstrations</summary>
-
-#### Demonstration 1: Efficient Operation in Claude Code
-
-A demonstration of Serena efficiently retrieving and editing code within Claude Code, thereby saving tokens and time. Efficient operations are not only useful for saving costs, but also for generally improving the generated code's quality. This effect may be less pronounced in very small projects, but often becomes of crucial importance in larger ones.
-
-https://github.com/user-attachments/assets/ab78ebe0-f77d-43cc-879a-cc399efefd87
-
-#### Demonstration 2: Serena in Claude Desktop
-
-A demonstration of Serena implementing a small feature for itself (a better log GUI) with Claude Desktop.
-Note how Serena's tools enable Claude to find and edit the right symbols.
-
-https://github.com/user-attachments/assets/6eaa9aa1-610d-4723-a2d6-bf1e487ba753
 </details>
 
 ## Quick Start

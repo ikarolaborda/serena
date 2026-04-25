@@ -139,6 +139,26 @@ class TopLevelCommands(AutoRegisteringGroup):
             "that separate entrypoint for performance reasons, see `serena-hooks --help`. You can run `<command> --help` for more info on each command.",
         )
 
+        # register --version / -V flag
+        self.params.append(
+            click.Option(
+                ["--version", "-V"],
+                is_flag=True,
+                expose_value=False,
+                is_eager=True,
+                callback=self._print_version,
+                help="Show the version and exit.",
+            )
+        )
+
+    @staticmethod
+    def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+        """Print version string and exit if the flag is set."""
+        if not value:
+            return
+        click.echo(f"Serena {serena_version()}")
+        ctx.exit()
+
     @staticmethod
     @click.command(
         "init",
@@ -376,7 +396,6 @@ class TopLevelCommands(AutoRegisteringGroup):
     ) -> None:
         prefix = "You will receive access to Serena's symbolic tools. Below are instructions for using them, take them into account."
         postfix = "You begin by acknowledging that you understood the above instructions and are ready to receive tasks."
-        from serena.tools.workflow_tools import InitialInstructionsTool
 
         lvl = logging.getLevelNamesMapping()[log_level.upper()]
         logging.configure(level=lvl)
@@ -390,8 +409,7 @@ class TopLevelCommands(AutoRegisteringGroup):
             context=context_instance,
             modes=modes_selection_def,
         )
-        tool = agent.get_tool(InitialInstructionsTool)
-        instr = tool.apply()
+        instr = agent.create_system_prompt()
         if only_instructions:
             print(instr)
         else:
@@ -461,11 +479,10 @@ class TopLevelCommands(AutoRegisteringGroup):
     @click.argument("url", type=str)
     @click.option("--width", type=int, default=1400, show_default=True, help="Window width.")
     @click.option("--height", type=int, default=900, show_default=True, help="Window height.")
-    @click.option("--minimized", is_flag=True, default=False, help="Whether to start minimized/in tray.")
-    def dashboard_viewer(url: str, width: int, height: int, minimized: bool) -> None:
+    def dashboard_viewer(url: str, width: int, height: int) -> None:
         from serena.dashboard import SerenaDashboardViewer
 
-        viewer = SerenaDashboardViewer(url, start_minimized=minimized, width=width, height=height)
+        viewer = SerenaDashboardViewer(url, width=width, height=height)
         viewer.run()
 
 
