@@ -8,18 +8,22 @@ prompt: |
   Instead, for exploring and reading code in a token-efficient manner, use Serena's overview and symbolic search tools.
   For non-code files or for reads where you don't know the symbol's name path, you can use the pattern search tool.
 
-excluded_tools:
-  - create_text_file
-  - read_file
-  - execute_shell_command
-  - replace_content
+excluded_tools: []
+
+included_optional_tools:
+  - delete_lines
+  - insert_at_line
+  - replace_lines
+  - restart_language_server
+  - open_dashboard
+  - list_queryable_projects
+  - query_project
+  - remove_project
+  - think_about_collected_information
+  - think_about_task_adherence
+  - think_about_whether_you_are_done
 
 tool_description_overrides: {}
 
-# whether to assume that Serena shall only work on a single project in this context (provided that a project is given
-# when Serena is started).
-# If set to true and a project is provided at startup, the set of tools is limited to those required by the project's
-# concrete configuration, and other tools are excluded completely, allowing the set of tools to be minimal.
-# Tools explicitly disabled by the project will not be available at all.
-# The `activate_project` tool is always disabled in this case, as project switching cannot be allowed.
-single_project: true
+# Single-project mode is OFF in this fork: activate_project + project-management tools are surfaced.
+single_project: false

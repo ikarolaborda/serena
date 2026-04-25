@@ -9,12 +9,20 @@ prompt: |
   Instead, for exploring and reading code in a token-efficient manner, use Serena's overview and symbolic search tools. 
   For non-code files or for reads where you don't know the symbol's name path, you can use the pattern search tool.
 
-excluded_tools:
-  - create_text_file
-  - read_file
-  - execute_shell_command
-  - replace_content
+excluded_tools: []
 
+included_optional_tools:
+  - delete_lines
+  - insert_at_line
+  - replace_lines
+  - restart_language_server
+  - open_dashboard
+  - list_queryable_projects
+  - query_project
+  - remove_project
+  - think_about_collected_information
+  - think_about_task_adherence
+  - think_about_whether_you_are_done
 
 tool_description_overrides: {}
 

@@ -40,6 +40,20 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Reactivated `find_file` and `list_dir` in the `codex`, `ide`, `vscode`, `antigravity`,
     and `jb-ai-assistant` contexts so semantic + symbolic search tools are discoverable
     in those editors.
+  - **Maximum-toolset policy** for IDE-style contexts (`claude-code`, `codex`, `ide`, `vscode`,
+    `antigravity`, `junie`, `jb-ai-assistant`, `jb-copilot-plugin`, `copilot-cli`):
+     - `excluded_tools` cleared in all 9 contexts: `create_text_file`, `read_file`,
+       `execute_shell_command`, `replace_content` are now exposed by default.
+     - `single_project: false` set in all 9 contexts so `activate_project` and project-management
+       tools (`list_queryable_projects`, `query_project`, `remove_project`) become available.
+       Trade-off: agents in those contexts can switch projects mid-session.
+     - `included_optional_tools` populated with the line-edit fallbacks (`delete_lines`,
+       `insert_at_line`, `replace_lines`), `restart_language_server`, `open_dashboard`,
+       project-management tools, and the three workflow-reflection tools
+       (`think_about_collected_information`, `think_about_task_adherence`,
+       `think_about_whether_you_are_done`).
+     - The two JetBrains-flavored contexts (`jb-ai-assistant`, `jb-copilot-plugin`) additionally
+       expose all ten `jet_brains_*` optional tools.
 
 * JetBrains:
   - Add `debug` tool: The agent can set breakpoints, inspect variables, evaluate expressions and control execution flow
