@@ -373,7 +373,7 @@ class SearchForPatternTool(Tool):
             For example, for finding classes or methods from a name pattern.
             Setting to False is a better choice if you also want to search in non-code files, like in html or yaml files,
             which is why it is the default.
-        :return: A mapping of file paths to lists of matched consecutive lines.
+        :return: A mapping from file paths to matched consecutive lines (0-based line numbers).
         """
         abs_path = os.path.join(self.get_project_root(), relative_path)
         if not os.path.exists(abs_path):
