@@ -1,5 +1,6 @@
 from typing import Literal
 
+from serena.project import MemoriesManager
 from serena.tools import Tool, ToolMarkerCanEdit
 
 
@@ -9,7 +10,13 @@ class WriteMemoryTool(Tool, ToolMarkerCanEdit):
     The memory name should be meaningful.
     """
 
-    def apply(self, memory_name: str, content: str, max_chars: int = -1) -> str:
+    def apply(
+        self,
+        memory_name: str,
+        content: str,
+        max_chars: int = -1,
+        tags: list[str] | None = None,
+    ) -> str:
         """
         Write information (utf-8-encoded) about this project that can be useful for future tasks to a memory in md format.
         The memory name should be meaningful and can include "/" to organize into topics (e.g., "auth/login/logic").
@@ -18,10 +25,21 @@ class WriteMemoryTool(Tool, ToolMarkerCanEdit):
 
         :param max_chars: the maximum number of characters to write. By default, determined by the config,
             change only if instructed to do so.
+        :param tags: optional list of short string tags. When provided, they are serialized as YAML
+            frontmatter (``tags: [...]``) at the top of the memory so future searches can filter by tag.
+            Existing memories without frontmatter remain valid.
         """
         # NOTE: utf-8 encoding is configured in the MemoriesManager
         if max_chars == -1:
             max_chars = self.agent.serena_config.default_max_tool_answer_chars
+
+        if tags:
+            normalized_tags = [str(t).strip() for t in tags if str(t).strip()]
+            if normalized_tags:
+                # if caller already provided their own frontmatter, leave content alone
+                if not content.startswith(MemoriesManager._FRONTMATTER_DELIM + "\n"):
+                    content = MemoriesManager.serialize_frontmatter({"tags": normalized_tags}) + content
+
         if len(content) > max_chars:
             raise ValueError(
                 f"Content for {memory_name} is too long. Max length is {max_chars} characters. " + "Please make the content shorter."
@@ -113,3 +131,89 @@ class EditMemoryTool(Tool, ToolMarkerCanEdit):
             If false and multiple occurrences are found, an error will be returned.
         """
         return self.memories_manager.edit_memory(memory_name, needle, repl, mode, allow_multiple_occurrences, is_tool_context=True)
+
+
+class SearchMemoriesTool(Tool):
+    """
+    Search the contents of project and global memories for a substring or regex pattern.
+
+    Returns matched memory names with 0-based snippet line numbers, ordered by match
+    frequency (descending) and then memory name. Useful for discovering which memory to
+    read in full afterwards. Snippets are truncated to a configurable length.
+
+    Tag filtering is *disjunctive*: when a tags list is passed, a memory matches if any of
+    its YAML-frontmatter ``tags`` overlap with the requested tags. Memories whose
+    frontmatter is absent or malformed have no tags and are skipped when the tag filter
+    is non-empty.
+    """
+
+    def apply(
+        self,
+        pattern: str,
+        mode: Literal["literal", "regex"] = "literal",
+        topic: str = "",
+        tags: list[str] | None = None,
+        max_memories: int = 20,
+        max_matches_per_memory: int = 5,
+        case_sensitive: bool = False,
+        max_answer_chars: int = -1,
+    ) -> str:
+        """
+        Search across memory file contents.
+
+        :param pattern: substring (when ``mode='literal'``) or Python regex (when ``mode='regex'``) to search for.
+        :param mode: ``literal`` or ``regex``. Default ``literal``.
+        :param topic: optional topic prefix (e.g. ``auth`` or ``global/java``) to scope the search.
+        :param tags: optional list of tags; when provided, only memories whose YAML-frontmatter
+            ``tags`` field overlaps are searched. Memories without frontmatter are skipped if tags are passed.
+        :param max_memories: hard cap on number of distinct memories returned (default 20).
+        :param max_matches_per_memory: hard cap on snippets per memory (default 5).
+        :param case_sensitive: if true, match case-sensitively. Default false.
+        :param max_answer_chars: total character cap for the response. -1 uses the agent default.
+        :return: JSON describing matches and aggregated counts per memory.
+        """
+        if max_answer_chars == -1:
+            max_answer_chars = self.agent.serena_config.default_max_tool_answer_chars
+
+        try:
+            matches = self.memories_manager.search_memories(
+                pattern=pattern,
+                mode=mode,
+                topic=topic,
+                tags=tuple(tags or ()),
+                max_memories=max_memories,
+                max_matches_per_memory=max_matches_per_memory,
+                case_sensitive=case_sensitive,
+            )
+        except Exception as e:
+            raise ValueError(f"search_memories failed: {e}") from e
+
+        per_memory: dict[str, dict] = {}
+        for m in matches:
+            entry = per_memory.setdefault(
+                m.memory_name,
+                {"memory_name": m.memory_name, "is_read_only": m.is_read_only, "match_count": 0, "matches": []},
+            )
+            entry["match_count"] += 1
+            entry["matches"].append({"line": m.line_number, "snippet": m.snippet})
+
+        ranked = sorted(per_memory.values(), key=lambda e: (-e["match_count"], e["memory_name"]))
+        result = {
+            "pattern": pattern,
+            "mode": mode,
+            "topic": topic,
+            "tags": tags or [],
+            "memories_found": len(ranked),
+            "results": ranked,
+        }
+        result_json = self._to_json(result)
+
+        def make_summary() -> str:
+            return self._to_json(
+                {
+                    "memories_found": len(ranked),
+                    "memory_names": [e["memory_name"] for e in ranked],
+                }
+            )
+
+        return self._limit_length(result_json, max_answer_chars, shortened_result_factories=[make_summary])

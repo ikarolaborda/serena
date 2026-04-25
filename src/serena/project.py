@@ -4,6 +4,7 @@ import re
 import shutil
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -265,6 +266,177 @@ class MemoriesManager:
         with open(memory_file_path, "w", encoding=self._encoding) as f:
             f.write(updated_content)
         return f"Memory {name} edited successfully."
+
+    _FRONTMATTER_DELIM = "---"
+    _FRONTMATTER_MAX_BYTES = 4096
+    _SUPPORTED_FRONTMATTER_KEYS = ("tags", "type", "description")
+
+    @classmethod
+    def parse_frontmatter(cls, raw_content: str) -> tuple[dict[str, Any], str]:
+        """
+        Parse a conservative YAML-style frontmatter block at the start of ``raw_content``.
+
+        Only treats the file as frontmatter-bearing when it starts at byte 0 with a
+        standalone ``---`` line and a closing ``---`` line is found within the first
+        ``_FRONTMATTER_MAX_BYTES``. Returns an empty metadata dict (and the original
+        body) for any malformed or missing frontmatter, so legacy memories remain
+        backward-compatible.
+
+        Recognized keys: ``tags`` (list/CSV string), ``type`` (str), ``description`` (str).
+        Other keys are ignored to keep the surface narrow and predictable.
+        """
+        if not raw_content.startswith(cls._FRONTMATTER_DELIM + "\n") and not raw_content.startswith(cls._FRONTMATTER_DELIM + "\r\n"):
+            return {}, raw_content
+        head = raw_content[: cls._FRONTMATTER_MAX_BYTES]
+        # find closing delimiter on its own line within the head budget
+        m = re.search(r"\n" + re.escape(cls._FRONTMATTER_DELIM) + r"\s*(?:\r?\n|$)", head)
+        if m is None:
+            return {}, raw_content
+        first_nl = raw_content.find("\n") + 1
+        block = raw_content[first_nl : m.start() + 1]
+        body = raw_content[m.end():]
+        metadata: dict[str, Any] = {}
+        for line in block.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" not in stripped:
+                # malformed line -> abort, treat whole file as body for safety
+                return {}, raw_content
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if key not in cls._SUPPORTED_FRONTMATTER_KEYS:
+                continue
+            if key == "tags":
+                # accept ["a", "b"], [a, b], or CSV "a, b"
+                if value.startswith("[") and value.endswith("]"):
+                    inner = value[1:-1]
+                else:
+                    inner = value
+                tags = [t.strip().strip("'\"") for t in inner.split(",") if t.strip()]
+                metadata["tags"] = tags
+            else:
+                metadata[key] = value.strip("'\"")
+        return metadata, body
+
+    @classmethod
+    def serialize_frontmatter(cls, metadata: dict[str, Any]) -> str:
+        """Render a minimal YAML-style frontmatter block; counterpart of ``parse_frontmatter``."""
+        if not metadata:
+            return ""
+        lines = [cls._FRONTMATTER_DELIM]
+        for key in cls._SUPPORTED_FRONTMATTER_KEYS:
+            if key not in metadata:
+                continue
+            value = metadata[key]
+            if key == "tags" and isinstance(value, list | tuple):
+                rendered = "[" + ", ".join(f'"{t}"' for t in value) + "]"
+            else:
+                rendered = str(value)
+            lines.append(f"{key}: {rendered}")
+        lines.append(cls._FRONTMATTER_DELIM)
+        lines.append("")
+        return "\n".join(lines)
+
+    def read_memory_metadata(self, name: str) -> dict[str, Any]:
+        """Return the parsed frontmatter metadata for a memory, or {} when none/invalid."""
+        self._check_not_ignored(name)
+        memory_file_path = self.get_memory_file_path(name)
+        if not memory_file_path.exists():
+            return {}
+        with open(memory_file_path, encoding=self._encoding) as f:
+            head = f.read(self._FRONTMATTER_MAX_BYTES + len(self._FRONTMATTER_DELIM) + 4)
+        metadata, _ = self.parse_frontmatter(head)
+        return metadata
+
+    @dataclass
+    class MemoryMatch:
+        """A single match within a memory file."""
+
+        memory_name: str
+        line_number: int
+        snippet: str
+        is_read_only: bool
+
+    def search_memories(
+        self,
+        pattern: str,
+        *,
+        mode: Literal["literal", "regex"] = "literal",
+        topic: str = "",
+        tags: Sequence[str] = (),
+        max_memories: int = 20,
+        max_matches_per_memory: int = 5,
+        snippet_max_chars: int = 240,
+        case_sensitive: bool = False,
+    ) -> list["MemoriesManager.MemoryMatch"]:
+        """
+        Search memory contents for ``pattern`` and return bounded ``MemoryMatch`` records.
+
+        - Honors ``ignored_memory_patterns`` for discovery.
+        - Read-only status is reported on each hit but does not block searching (the tool is read-only).
+        - Substring (``literal``) and ``regex`` modes; invalid regex raises ``re.error``.
+        - When ``tags`` is non-empty, only memories whose frontmatter tags overlap are returned;
+          memories without frontmatter are skipped if ``tags`` was passed (explicit filter).
+        - Hard caps: ``max_memories`` files, ``max_matches_per_memory`` matches per file,
+          ``snippet_max_chars`` per snippet.
+        """
+        if mode == "regex":
+            flags = 0 if case_sensitive else re.IGNORECASE
+            compiled = re.compile(pattern, flags)
+        else:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            compiled = re.compile(re.escape(pattern), flags)
+
+        listing = self.list_memories(topic=topic)
+        all_names = listing.get_full_list()
+        read_only_set = set(listing.read_only_memories)
+        tag_filter = {t.strip().lower() for t in tags if t.strip()}
+
+        results: list[MemoriesManager.MemoryMatch] = []
+        seen_memories = 0
+        for memory_name in all_names:
+            if seen_memories >= max_memories:
+                break
+            try:
+                memory_path = self.get_memory_file_path(memory_name)
+            except (ValueError, AssertionError):
+                continue
+            if not memory_path.exists():
+                continue
+            try:
+                with open(memory_path, encoding=self._encoding) as f:
+                    raw = f.read()
+            except OSError:
+                continue
+
+            metadata, body = self.parse_frontmatter(raw)
+            if tag_filter:
+                memory_tags = {str(t).lower() for t in metadata.get("tags", [])}
+                if not memory_tags or memory_tags.isdisjoint(tag_filter):
+                    continue
+
+            file_matches = 0
+            for line_idx, line in enumerate(body.splitlines()):
+                if file_matches >= max_matches_per_memory:
+                    break
+                if compiled.search(line):
+                    snippet = line.strip()
+                    if len(snippet) > snippet_max_chars:
+                        snippet = snippet[: snippet_max_chars - 1].rstrip() + "…"
+                    results.append(
+                        MemoriesManager.MemoryMatch(
+                            memory_name=memory_name,
+                            line_number=line_idx,
+                            snippet=snippet,
+                            is_read_only=memory_name in read_only_set,
+                        )
+                    )
+                    file_matches += 1
+            if file_matches > 0:
+                seen_memories += 1
+        return results
 
 
 class Project(ToStringMixin):

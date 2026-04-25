@@ -5,6 +5,17 @@ Status of the `main` branch. Changes prior to the next official version change w
 * General:
   - Support environment variable `SERENA_USAGE_REPORTING` (set to `false` to disable usage reporting)
   - Extended the list of always ignored directories (by language servers) with common cases.
+  - **Fix**: `search_for_pattern` (and any caller of `text_utils.search_text`) now returns 0-based
+    line numbers, matching every other Serena tool. Previously these results were 1-based.
+    The system prompt now states the 0-based convention explicitly.
+  - **New tool**: `search_memories` — substring or regex search across project + global memory
+    contents with bounded snippets, optional tag filter, and per-tool output budgeting.
+  - `write_memory` accepts an optional `tags` list which is serialized as a conservative
+    YAML-style frontmatter block atop the memory file. Existing memories without frontmatter
+    remain valid; `MemoriesManager.read_memory_metadata` exposes parsed `tags`/`type`/`description`.
+  - Reactivated `find_file` and `list_dir` in the `codex`, `ide`, `vscode`, `antigravity`,
+    and `jb-ai-assistant` contexts so semantic + symbolic search tools are discoverable
+    in those editors. `replace_content` remains excluded in `codex` (matches existing fork policy).
 
 JetBrains: 
   - Improve handling of `relative_path` parameter 
