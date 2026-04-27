@@ -1,5 +1,3 @@
-from sensai.util.helper import mark_used
-
 from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional
 
 
@@ -33,10 +31,37 @@ class ActivateProjectTool(Tool, ToolMarkerDoesNotRequireActiveProject):
         :param project: the name of a registered project to activate or a path to a project directory
         """
         is_new_activation = self.agent.activate_project_from_path_or_name(project)
-        mark_used(is_new_activation)
+        receipt = self._render_activation_receipt(is_new_activation)
         result = self.agent.get_project_activation_message(session_id)
         result += "\nIMPORTANT: If you have not yet read the 'Serena Instructions Manual', do it now before continuing!"
+        if receipt:
+            return f"{receipt}\n{result}"
         return result
+
+    def _render_activation_receipt(self, is_new_activation: bool) -> str:
+        """
+        Builds a concise activation/switch receipt that the agent sees before the standard
+        activation message. Distinguishes first activation, project switch, and same-project
+        re-activation so warnings are only shown when relative paths or symbol references from
+        a previous project may genuinely be stale.
+        """
+        info = self.agent.get_last_activation_info()
+        if info is None:
+            return ""
+
+        activation_id = info["activation_id"]
+        to_name = info["to"]
+        from_name = info["from"]
+
+        if not is_new_activation:
+            return f"Project re-activated: {to_name} (activation_id={activation_id})"
+        if from_name is None:
+            return f"Project activated: {to_name} (activation_id={activation_id})"
+        return (
+            f"Project switched: {from_name} -> {to_name} (activation_id={activation_id})\n"
+            f"WARNING: cached relative paths or symbol references from '{from_name}' "
+            "are no longer valid; re-read files before editing."
+        )
 
 
 class RemoveProjectTool(Tool, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional):

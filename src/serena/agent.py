@@ -8,6 +8,7 @@ import os
 import platform
 import signal
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logging import Logger
-from typing import TYPE_CHECKING, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 import requests
 import webview
@@ -26,7 +27,7 @@ from sensai.util.string import dict_string
 
 from interprompt.jinja_template import JinjaTemplate
 from serena import serena_version
-from serena.analytics import RegisteredTokenCountEstimator, ToolUsageStats
+from serena.analytics import ProjectSwitchEvent, ProjectSwitchStats, RegisteredTokenCountEstimator, ToolUsageStats
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
 from serena.config.serena_config import (
     LanguageBackend,
@@ -589,6 +590,13 @@ class SerenaAgent:
         log.info(f"Will record tool usage statistics with token count estimator: {token_count_estimator.name}.")
         self._tool_usage_stats = ToolUsageStats(token_count_estimator)
 
+        # Project-switch instrumentation: monotonic activation_id + recent-events buffer surfaced
+        # via ActivateProjectTool receipts and the dashboard. Mutated only inside _activate_project,
+        # which runs serially on the agent's task executor.
+        self._activation_counter: int = 0
+        self._last_activation_info: dict[str, Any] | None = None
+        self._project_switch_stats = ProjectSwitchStats()
+
         # log fundamental information
         log.info(
             f"Starting Serena server (version={self.version}, process id={os.getpid()}, parent process id={os.getppid()}; "
@@ -1085,13 +1093,19 @@ class SerenaAgent:
                 f"(2) Configure one MCP server per backend in your client."
             )
 
+        previous_project_name: str | None = None
+        shutdown_ms: float = 0.0
         # shut down the previously active project to release its language server processes
         if self._active_project is not None:
-            log.info(f"Shutting down previously active project '{self._active_project.project_name}' before switching")
+            previous_project_name = self._active_project.project_name
+            log.info(f"Shutting down previously active project '{previous_project_name}' before switching")
+            shutdown_start = time.perf_counter()
             self._active_project.shutdown()
+            shutdown_ms = (time.perf_counter() - shutdown_start) * 1000.0
 
         self._active_project = project
         project.set_agent(self)
+        self._activation_counter += 1
 
         if update_active_modes:
             active_mode_names_before = set(self._active_modes.get_mode_names())
@@ -1111,6 +1125,7 @@ class SerenaAgent:
                 self.reset_language_server_manager()
 
         # initialize the language server in the background (if in language server mode)
+        ls_init_started = False
         if self.get_language_backend().is_lsp():
             # Bounded task-level timeout so that a stuck LS startup cannot stall the agent's single-thread
             # task executor forever and block every subsequent tool call. A generous headroom above the
@@ -1119,6 +1134,32 @@ class SerenaAgent:
                 init_language_server_manager,
                 timeout=self.serena_config.ls_startup_timeout + 30,
             )
+            ls_init_started = True
+
+        switch_event = ProjectSwitchEvent(
+            activation_id=self._activation_counter,
+            from_project=previous_project_name,
+            to_project=project.project_name,
+            shutdown_ms=shutdown_ms,
+            ls_init_started=ls_init_started,
+        )
+        self._project_switch_stats.record(switch_event)
+        self._last_activation_info = {
+            "activation_id": switch_event.activation_id,
+            "from": switch_event.from_project,
+            "to": switch_event.to_project,
+            "shutdown_ms": switch_event.shutdown_ms,
+            "ls_init_started": switch_event.ls_init_started,
+            "switched_at": switch_event.timestamp,
+        }
+        log.info(
+            "project_switch event: activation_id=%d from=%s to=%s shutdown_ms=%.1f ls_init_started=%s",
+            switch_event.activation_id,
+            switch_event.from_project,
+            switch_event.to_project,
+            switch_event.shutdown_ms,
+            switch_event.ls_init_started,
+        )
 
         if self._project_activation_callback is not None:
             self._project_activation_callback()
@@ -1128,6 +1169,16 @@ class SerenaAgent:
             self._dashboard_manager.update_active_project(self._active_project)
 
         return True
+
+    def get_last_activation_info(self) -> dict[str, Any] | None:
+        """
+        :return: a dict describing the most recent newly-activated project (with from=None on
+            the very first activation), or None if no project has been activated yet
+        """
+        return dict(self._last_activation_info) if self._last_activation_info is not None else None
+
+    def get_project_switch_stats(self) -> ProjectSwitchStats:
+        return self._project_switch_stats
 
     def activate_project_from_path_or_name(
         self, project_root_or_name: str, update_active_modes: bool = True, update_active_tools: bool = True

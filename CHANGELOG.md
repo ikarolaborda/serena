@@ -54,6 +54,18 @@ Status of the `main` branch. Changes prior to the next official version change w
        `think_about_whether_you_are_done`).
      - The two JetBrains-flavored contexts (`jb-ai-assistant`, `jb-copilot-plugin`) additionally
        expose all ten `jet_brains_*` optional tools.
+  - **Project-switch instrumentation** for the `single_project: false` IDE contexts:
+     - `ActivateProjectTool` now prepends a one-line activation receipt distinguishing first
+       activation, project switch (with a stale-paths warning), and same-project re-activation
+       (no warning). Each receipt includes a monotonic `activation_id` so downstream agents
+       can detect mid-session project boundaries.
+     - New `analytics.ProjectSwitchStats` records each real activation as a structured event
+       (`activation_id`, `from_project`, `to_project`, `shutdown_ms`, `ls_init_started`,
+       `timestamp`) in a thread-safe ring buffer (max 100 events).
+     - New dashboard endpoint `GET /get_project_switches` exposes the summary
+       (`total_recorded`, `switch_count`, `last`) for debugging or telemetry inspection.
+     - Same-project re-activation does not bump the activation counter or emit a stale-paths
+       warning, matching `_activate_project`'s existing early-return on identical project root.
 
 * JetBrains:
   - Add `debug` tool: The agent can set breakpoints, inspect variables, evaluate expressions and control execution flow

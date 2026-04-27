@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 
 from anthropic.types import MessageParam, MessageTokensCount
 from dotenv import load_dotenv
@@ -172,3 +174,61 @@ class ToolUsageStats:
     def clear(self) -> None:
         with self._tool_stats_lock:
             self._tool_stats.clear()
+
+
+@dataclass(kw_only=True)
+class ProjectSwitchEvent:
+    """A structured record of a single project activation or switch."""
+
+    activation_id: int
+    from_project: str | None
+    to_project: str
+    shutdown_ms: float
+    ls_init_started: bool
+    timestamp: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
+
+    @property
+    def is_first_activation(self) -> bool:
+        return self.from_project is None
+
+    @property
+    def is_switch(self) -> bool:
+        return self.from_project is not None and self.from_project != self.to_project
+
+
+class ProjectSwitchStats:
+    """
+    Thread-safe ring buffer of recent project activation events plus aggregate counters.
+    Surfaced via the dashboard and consumed by ActivateProjectTool to render activation receipts.
+    """
+
+    DEFAULT_MAX_EVENTS = 100
+
+    def __init__(self, max_events: int = DEFAULT_MAX_EVENTS):
+        self._events: deque[ProjectSwitchEvent] = deque(maxlen=max_events)
+        self._switch_count = 0
+        self._lock = threading.Lock()
+
+    def record(self, event: ProjectSwitchEvent) -> None:
+        with self._lock:
+            self._events.append(event)
+            if event.is_switch:
+                self._switch_count += 1
+
+    def get_events(self) -> list[ProjectSwitchEvent]:
+        with self._lock:
+            return list(self._events)
+
+    def get_summary(self) -> dict[str, Any]:
+        with self._lock:
+            last_event = self._events[-1] if self._events else None
+            return {
+                "total_recorded": len(self._events),
+                "switch_count": self._switch_count,
+                "last": asdict(last_event) if last_event is not None else None,
+            }
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._switch_count = 0

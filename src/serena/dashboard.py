@@ -260,6 +260,10 @@ class SerenaDashboardAPI:
             self._clear_tool_stats()
             return {"status": "cleared"}
 
+        @self._app.route("/get_project_switches", methods=["GET"])
+        def get_project_switches_route() -> dict[str, Any]:
+            return self._agent.get_project_switch_stats().get_summary()
+
         @self._app.route("/clear_logs", methods=["POST"])
         def clear_logs() -> dict[str, str]:
             self._memory_log_handler.clear_log_messages()

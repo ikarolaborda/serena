@@ -793,3 +793,31 @@ class TestPromptProvision:
 
         result2 = self._call_tool(serena_agent, ActivateProjectTool, project=project_name, session_id=session)
         self._assert_activation_message(result2, project_name, present=True)
+
+    @pytest.mark.parametrize("serena_agent", [Language.PYTHON], indirect=True)
+    def test_activate_project_tool_renders_switch_receipt(self, serena_agent: SerenaAgent) -> None:
+        # The fixture pre-activates project_name1, so activation_id starts at 1 with from=None.
+        project_name1 = "test_repo_python"
+        project_name2 = "test_repo_java"
+        session = "session1"
+
+        # Re-activation of the already-active project -> no counter bump, no stale-reference warning
+        result1 = self._call_tool(serena_agent, ActivateProjectTool, project=project_name1, session_id=session)
+        assert f"Project re-activated: {project_name1} (activation_id=1)" in result1
+        assert "WARNING: cached relative paths" not in result1
+
+        # Switch -> "Project switched: ... -> ..." plus the warning, counter bumps to 2
+        result2 = self._call_tool(serena_agent, ActivateProjectTool, project=project_name2, session_id=session)
+        assert f"Project switched: {project_name1} -> {project_name2} (activation_id=2)" in result2
+        assert "WARNING: cached relative paths" in result2
+
+        # Re-activation of the new project -> still activation_id=2, no stale warning
+        result3 = self._call_tool(serena_agent, ActivateProjectTool, project=project_name2, session_id=session)
+        assert f"Project re-activated: {project_name2} (activation_id=2)" in result3
+        assert "WARNING: cached relative paths" not in result3
+
+        # Telemetry: stats record at least the switch event
+        summary = serena_agent.get_project_switch_stats().get_summary()
+        assert summary["switch_count"] >= 1
+        assert summary["last"]["activation_id"] == 2
+        assert summary["last"]["to_project"] == project_name2
