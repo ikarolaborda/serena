@@ -25,8 +25,11 @@ from serena.analytics import ToolUsageStats
 from serena.config.serena_config import SerenaConfig, SerenaPaths
 from serena.constants import SERENA_DASHBOARD_DIR, SerenaPorts
 from serena.task_executor import TaskExecutor
+from serena.util.atomic_io import atomic_write_text, cross_process_lock
 from serena.util.logging import MemoryLogHandler
 from serena.util.pywebview import WebViewWithTray
+
+from filelock import Timeout as FileLockTimeout
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -686,9 +689,24 @@ class SerenaDashboardAPI:
     _NEWS_JSON_URL = "https://oraios-software.de/serena_news.json"
 
     def _fetch_news(self) -> None:
-        """Fetch news.json from GitHub using ETag-based caching and store in memory. Silently ignores network errors."""
-        paths = SerenaPaths()
+        """Fetch news.json from GitHub using ETag-based caching and store in memory. Silently ignores network errors.
 
+        When several Serena instances start in parallel they would otherwise all fetch the
+        feed and race on the cache files. We acquire a non-blocking lock; the first instance
+        does the fetch, the others fall back to whatever the cache currently holds.
+        """
+        paths = SerenaPaths()
+        lock_path = Path(paths.serena_user_home_dir) / "news.lock"
+
+        try:
+            with cross_process_lock(lock_path, timeout=0):
+                self._fetch_news_locked(paths)
+        except FileLockTimeout:
+            # Another Serena instance is already fetching; serve the cached copy.
+            self._loaded_news = self._load_previously_fetched_news_data()
+            self._news_ready.set()
+
+    def _fetch_news_locked(self, paths: SerenaPaths) -> None:
         headers: dict[str, str] = {}
         # Load stored ETag if available
         if os.path.exists(paths.news_etag_file) and os.path.exists(paths.news_file):
@@ -708,12 +726,10 @@ class SerenaDashboardAPI:
                 body = response.read().decode("utf-8")
                 # Validate JSON
                 fetched_news_dict = json.loads(body)
-                # Store news content and ETag
-                with open(paths.news_file, "w", encoding="utf-8") as f:
-                    f.write(body)
+                # Atomic publish so concurrent readers never see partial JSON.
+                atomic_write_text(paths.news_file, body, encoding="utf-8")
                 if etag:
-                    with open(paths.news_etag_file, "w", encoding="utf-8") as f:
-                        f.write(etag)
+                    atomic_write_text(paths.news_etag_file, etag, encoding="utf-8")
                 log.info("Remote news updated from %s", self._NEWS_JSON_URL)
         except urllib.error.HTTPError as e:
             if e.code == 304:
@@ -786,9 +802,29 @@ class SerenaDashboardAPI:
         return port
 
     def run_in_thread(self, host: str) -> tuple[threading.Thread, int]:
+        # _find_first_free_port releases its socket before we hand the port to werkzeug;
+        # under concurrent Serena startups another instance can grab the same port in that
+        # gap. Build the WSGI server here so bind happens synchronously, retry on collision.
+        from werkzeug.serving import make_server
+
         port = self._find_first_free_port(self.BASE_PORT, host)
+        max_retries = 10
+        last_error: OSError | None = None
+        server = None
+        for _ in range(max_retries):
+            try:
+                server = make_server(host, port, self._app, threaded=True)
+                break
+            except OSError as e:
+                last_error = e
+                # Another process won the race; advance and try again.
+                port = self._find_first_free_port(port + 1, host)
+        if server is None:
+            assert last_error is not None
+            raise RuntimeError(f"Could not bind dashboard after {max_retries} attempts") from last_error
+
         log.info("Starting dashboard (listen_address=%s, port=%d)", host, port)
-        thread = threading.Thread(target=lambda: self.run(host=host, port=port), daemon=True)
+        thread = threading.Thread(target=server.serve_forever, name="serena-dashboard", daemon=True)
         thread.start()
         return thread, port
 

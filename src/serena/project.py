@@ -19,6 +19,7 @@ from serena.config.serena_config import (
 )
 from serena.constants import SERENA_FILE_ENCODING
 from serena.ls_manager import LanguageServerFactory, LanguageServerManager
+from serena.util.atomic_io import atomic_write_text, cross_process_lock
 from serena.util.file_system import GitignoreParser, match_path
 from serena.util.text_utils import ContentReplacer, MatchedConsecutiveLines, search_files
 from solidlsp import SolidLanguageServer
@@ -61,6 +62,9 @@ class MemoriesManager:
         self._encoding = SERENA_FILE_ENCODING
         self._read_only_memory_patterns = [re.compile(pattern) for pattern in set(read_only_memory_patterns)]
         self._ignored_memory_patterns = [re.compile(pattern) for pattern in set(ignored_memory_patterns)]
+        # In-process serialization for read-modify-write paths (edit_memory, move_memory).
+        # Cross-process safety is provided by the per-file lock in `_locked_memory_path`.
+        self._instance_lock = threading.RLock()
 
     def _is_read_only_memory(self, name: str) -> bool:
         for pattern in self._read_only_memory_patterns:
@@ -124,20 +128,28 @@ class MemoriesManager:
         if is_tool_context and self._is_read_only_memory(name):
             raise PermissionError(f"Attempted to write to read_only memory: '{name}')")
 
+    def _lock_path_for(self, memory_file_path: Path) -> Path:
+        # Sibling lock file so two processes touching the same memory serialise.
+        return memory_file_path.with_suffix(memory_file_path.suffix + ".lock")
+
     def load_memory(self, name: str) -> str:
         self._check_not_ignored(name)
         memory_file_path = self.get_memory_file_path(name)
         if not memory_file_path.exists():
             return f"Memory file {name} not found, consider creating it with the `write_memory` tool if you need it."
-        with open(memory_file_path, encoding=self._encoding) as f:
-            return f.read()
+        # Take the cross-process lock briefly so we don't observe a writer mid-rename
+        # (atomic_write_text makes torn reads impossible, but a concurrent edit_memory
+        # could still publish a stale revision if we read before its rename completes).
+        with cross_process_lock(self._lock_path_for(memory_file_path)):
+            with open(memory_file_path, encoding=self._encoding) as f:
+                return f.read()
 
     def save_memory(self, name: str, content: str, is_tool_context: bool) -> str:
         self._check_not_ignored(name)
         self._check_write_access(name, is_tool_context)
         memory_file_path = self.get_memory_file_path(name)
-        with open(memory_file_path, "w", encoding=self._encoding) as f:
-            f.write(content)
+        with self._instance_lock, cross_process_lock(self._lock_path_for(memory_file_path)):
+            atomic_write_text(memory_file_path, content, encoding=self._encoding)
         return f"Memory {name} written."
 
     class MemoriesList:
@@ -218,9 +230,10 @@ class MemoriesManager:
         self._check_not_ignored(name)
         self._check_write_access(name, is_tool_context)
         memory_file_path = self.get_memory_file_path(name)
-        if not memory_file_path.exists():
-            return f"Memory {name} not found."
-        memory_file_path.unlink()
+        with self._instance_lock, cross_process_lock(self._lock_path_for(memory_file_path)):
+            if not memory_file_path.exists():
+                return f"Memory {name} not found."
+            memory_file_path.unlink()
         return f"Memory {name} deleted."
 
     def move_memory(self, old_name: str, new_name: str, is_tool_context: bool) -> str:
@@ -235,13 +248,16 @@ class MemoriesManager:
         old_path = self.get_memory_file_path(old_name)
         new_path = self.get_memory_file_path(new_name)
 
-        if not old_path.exists():
-            raise FileNotFoundError(f"Memory {old_name} not found.")
-        if new_path.exists():
-            raise FileExistsError(f"Memory {new_name} already exists.")
-
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(old_path, new_path)
+        # Always acquire locks in path-sorted order to avoid deadlock between two
+        # concurrent move_memory calls that swap source/destination.
+        first, second = sorted([old_path, new_path])
+        with self._instance_lock, cross_process_lock(self._lock_path_for(first)), cross_process_lock(self._lock_path_for(second)):
+            if not old_path.exists():
+                raise FileNotFoundError(f"Memory {old_name} not found.")
+            if new_path.exists():
+                raise FileExistsError(f"Memory {new_name} already exists.")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(old_path, new_path)
 
         return f"Memory renamed from {old_name} to {new_name}."
 
@@ -260,14 +276,17 @@ class MemoriesManager:
         self._check_not_ignored(name)
         self._check_write_access(name, is_tool_context)
         memory_file_path = self.get_memory_file_path(name)
-        if not memory_file_path.exists():
-            raise FileNotFoundError(f"Memory {name} not found.")
-        with open(memory_file_path, encoding=self._encoding) as f:
-            original_content = f.read()
-        replacer = ContentReplacer(mode=mode, allow_multiple_occurrences=allow_multiple_occurrences)
-        updated_content = replacer.replace(original_content, needle, repl)
-        with open(memory_file_path, "w", encoding=self._encoding) as f:
-            f.write(updated_content)
+        # Read-modify-write must be serialized across both threads (within this Serena
+        # instance) and processes (other Serena instances pointed at the same project),
+        # otherwise concurrent edits silently lose changes.
+        with self._instance_lock, cross_process_lock(self._lock_path_for(memory_file_path)):
+            if not memory_file_path.exists():
+                raise FileNotFoundError(f"Memory {name} not found.")
+            with open(memory_file_path, encoding=self._encoding) as f:
+                original_content = f.read()
+            replacer = ContentReplacer(mode=mode, allow_multiple_occurrences=allow_multiple_occurrences)
+            updated_content = replacer.replace(original_content, needle, repl)
+            atomic_write_text(memory_file_path, updated_content, encoding=self._encoding)
         return f"Memory {name} edited successfully."
 
     _FRONTMATTER_DELIM = "---"
