@@ -30,6 +30,42 @@ class PromptFactoryBase:
     def _get_prompt_list(self, prompt_name: str) -> PromptList:
         return self._prompt_collection.get_prompt_list(prompt_name, self.lang_code)
 
+    def __getattr__(self, name: str) -> Any:
+        # Fallback when the auto-generated subclass is stale relative to the prompt
+        # templates on disk. Prevents AttributeError on prompts that were added to
+        # the templates after the generated module was last produced.
+        # __getattr__ is only consulted after normal attribute lookup fails, so
+        # generated methods take precedence.
+        if name.startswith("create_"):
+            template_name = name[len("create_"):]
+            try:
+                collection = object.__getattribute__(self, "_prompt_collection")
+            except AttributeError as exc:
+                raise AttributeError(name) from exc
+            if template_name in collection.get_prompt_template_names():
+                lang_code = object.__getattribute__(self, "lang_code")
+
+                def _dynamic_create(**params: Any) -> str:
+                    return collection.render_prompt_template(template_name, params, lang_code=lang_code)
+
+                _dynamic_create.__name__ = name
+                return _dynamic_create
+        if name.startswith("get_list_"):
+            list_name = name[len("get_list_"):]
+            try:
+                collection = object.__getattribute__(self, "_prompt_collection")
+            except AttributeError as exc:
+                raise AttributeError(name) from exc
+            if list_name in collection.get_prompt_list_names():
+                lang_code = object.__getattribute__(self, "lang_code")
+
+                def _dynamic_get_list() -> PromptList:
+                    return collection.get_prompt_list(list_name, lang_code)
+
+                _dynamic_get_list.__name__ = name
+                return _dynamic_get_list
+        raise AttributeError(name)
+
 
 def autogenerate_prompt_factory_module(prompts_dir: str, target_module_path: str) -> None:
     """
