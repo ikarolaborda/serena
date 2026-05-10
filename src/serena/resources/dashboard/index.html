@@ -147,6 +147,40 @@
                     </div>
                 </section>
 
+                <section class="projects-section">
+                    <h2 class="collapsible-header" id="memory-sync-header">
+                        <span>Memory Sync</span>
+                        <span class="toggle-icon">▼</span>
+                    </h2>
+                    <div id="memory-sync-display" class="collapsible-content" style="display:none">
+                        <div class="memory-sync-status">
+                            <div><b>Project:</b> <span id="memory-sync-project">—</span></div>
+                            <div><b>Last push:</b> <span id="memory-sync-last-push">—</span></div>
+                            <div><b>Outcome:</b> <span id="memory-sync-outcome">—</span></div>
+                            <div><b>Current run:</b> <span id="memory-sync-current">idle</span></div>
+                            <div><b>Credentials:</b> <span id="memory-sync-creds-state">—</span></div>
+                        </div>
+                        <div class="memory-sync-actions">
+                            <button id="memory-sync-refresh">Refresh</button>
+                            <button id="memory-sync-trigger">Run sync now</button>
+                            <button id="memory-sync-dry-run">Dry-run</button>
+                        </div>
+                        <details class="memory-sync-creds">
+                            <summary>R2 credentials (masked)</summary>
+                            <table id="memory-sync-creds-table">
+                                <thead><tr><th>Key</th><th>Current</th><th>New value</th></tr></thead>
+                                <tbody></tbody>
+                            </table>
+                            <button id="memory-sync-save-creds">Save credentials</button>
+                            <p class="memory-sync-note">
+                                Stored in <code>~/.serena/secrets.sqlite3</code> (chmod 600) and projected
+                                to <code>qdrant-memory/.env.r2</code> on save.
+                            </p>
+                        </details>
+                        <pre id="memory-sync-last-output" class="memory-sync-output"></pre>
+                    </div>
+                </section>
+
                 <!-- Gold Banners -->
                 <section id="gold-banners" class="gold-banners-section">
                     <button class="banner-arrow banner-arrow-left" data-target="gold" aria-label="Previous banner">&#8249;</button>

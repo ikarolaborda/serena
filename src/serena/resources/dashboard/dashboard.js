@@ -2247,3 +2247,111 @@ class Dashboard {
         self.$menuDropdown.hide();
     }
 }
+
+// ===== Memory Sync panel =====
+// Wired as a standalone IIFE to avoid touching the Dashboard class. The
+// collapsible header behaviour is already attached at class level.
+(function setupMemorySyncPanel() {
+    const $panel = $('#memory-sync-display');
+    if ($panel.length === 0) return;
+
+    const $project = $('#memory-sync-project');
+    const $lastPush = $('#memory-sync-last-push');
+    const $outcome = $('#memory-sync-outcome');
+    const $current = $('#memory-sync-current');
+    const $credsState = $('#memory-sync-creds-state');
+    const $output = $('#memory-sync-last-output');
+    const $credsTable = $('#memory-sync-creds-table tbody');
+
+    function fmtTs(s) { return s ? s.replace('T', ' ').replace('Z', ' UTC') : '—'; }
+
+    function refreshStatus() {
+        $.getJSON('/memory_sync/status').done(function (data) {
+            $project.text(data.project || 'no active project');
+            const push = (data.summary && data.summary.last_push) || null;
+            if (push) {
+                $lastPush.text(fmtTs(push.pushed_at) + ' — ' + (push.snapshot_id || ''));
+            } else {
+                $lastPush.text('never');
+            }
+            const last = data.last_run;
+            if (last) {
+                $outcome.text(last.outcome + (last.notes ? ' — ' + last.notes : ''));
+                $output.text(((last.stdout_tail || '') + '\n' + (last.stderr_tail || '')).trim());
+            } else {
+                $outcome.text('—');
+                $output.text('');
+            }
+            const cur = data.current_run;
+            $current.text(cur ? ('running — started ' + fmtTs(cur.started_at)) : 'idle');
+            $credsState.text(data.credentials_present ? 'all required keys present' : 'missing — set them below');
+        }).fail(function (xhr) {
+            $outcome.text('status error: ' + xhr.status);
+        });
+    }
+
+    function refreshCredentials() {
+        $.getJSON('/memory_sync/credentials').done(function (data) {
+            $credsTable.empty();
+            (data.required_keys || []).forEach(function (key) {
+                const masked = (data.values && data.values[key]) || '';
+                const row = $('<tr>');
+                row.append($('<td>').text(key));
+                row.append($('<td>').addClass('memory-sync-mask').text(masked || '— not set —'));
+                const input = $('<input type="password" autocomplete="new-password">').attr('data-key', key);
+                row.append($('<td>').append(input));
+                $credsTable.append(row);
+            });
+        });
+    }
+
+    function trigger(dryRun) {
+        $current.text('starting…');
+        $.ajax({
+            url: '/memory_sync/trigger',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ dry_run: !!dryRun }),
+        }).done(function () {
+            // Status polling will surface the result; small delay keeps the UI honest.
+            setTimeout(refreshStatus, 500);
+        }).fail(function (xhr) {
+            $outcome.text('trigger error: ' + xhr.status);
+        });
+    }
+
+    function saveCredentials() {
+        const values = {};
+        $credsTable.find('input[data-key]').each(function () {
+            const v = $(this).val();
+            if (v !== '') values[$(this).attr('data-key')] = v;
+        });
+        if (Object.keys(values).length === 0) {
+            alert('Nothing to save — fill at least one field.');
+            return;
+        }
+        $.ajax({
+            url: '/memory_sync/credentials',
+            type: 'PUT',
+            contentType: 'application/json',
+            data: JSON.stringify({ values: values }),
+        }).done(function () {
+            // Clear inputs (the masked Current column refreshes from server).
+            $credsTable.find('input[data-key]').val('');
+            refreshCredentials();
+            refreshStatus();
+        }).fail(function (xhr) {
+            alert('Could not save credentials: ' + xhr.status);
+        });
+    }
+
+    $('#memory-sync-refresh').on('click', function () { refreshStatus(); refreshCredentials(); });
+    $('#memory-sync-trigger').on('click', function () { trigger(false); });
+    $('#memory-sync-dry-run').on('click', function () { trigger(true); });
+    $('#memory-sync-save-creds').on('click', saveCredentials);
+
+    // Lazy-load when the section is first expanded.
+    $('#memory-sync-header').on('click', function () {
+        if ($panel.is(':visible')) { refreshStatus(); refreshCredentials(); }
+    });
+})();

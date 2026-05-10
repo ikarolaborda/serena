@@ -1398,3 +1398,15 @@ body {
     border-color: rgba(220, 53, 53, 0.9);
     color: var(--log-error);
 }
+
+/* ===== Memory Sync panel ===== */
+.memory-sync-status > div { padding: 2px 0; font-size: 0.95em; }
+.memory-sync-actions { margin: 10px 0; display: flex; gap: 6px; }
+.memory-sync-actions button { padding: 4px 10px; }
+.memory-sync-creds { margin-top: 12px; }
+.memory-sync-creds table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.memory-sync-creds th, .memory-sync-creds td { padding: 4px 6px; border-bottom: 1px solid var(--border-color); }
+.memory-sync-creds .memory-sync-mask { font-family: monospace; color: var(--text-secondary, #777); }
+.memory-sync-creds input[type="password"] { width: 100%; box-sizing: border-box; }
+.memory-sync-note { font-size: 0.8em; color: var(--text-secondary, #777); margin-top: 6px; }
+.memory-sync-output { max-height: 200px; overflow: auto; font-size: 0.8em; background: var(--bg-secondary, #f5f5f5); padding: 6px; margin-top: 8px; white-space: pre-wrap; }

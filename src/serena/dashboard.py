@@ -24,6 +24,7 @@ from sensai.util.pickle import dump_pickle, load_pickle
 from serena.analytics import ToolUsageStats
 from serena.config.serena_config import SerenaConfig, SerenaPaths
 from serena.constants import SERENA_DASHBOARD_DIR, SerenaPorts
+from serena.memory_sync import R2_REQUIRED_KEYS, R2_SCOPE, MemorySyncService
 from serena.task_executor import TaskExecutor
 from serena.util.atomic_io import atomic_write_text, cross_process_lock
 from serena.util.logging import MemoryLogHandler
@@ -208,6 +209,7 @@ class SerenaDashboardAPI:
         self._tool_usage_stats = tool_usage_stats
         self._loaded_news: dict[str, str] = {}
         self._news_ready = threading.Event()
+        self._memory_sync = MemorySyncService()
         self._setup_routes()
         self._read_news = ReadNews.load()
         # Fetch remote news in background on startup (non-blocking)
@@ -216,6 +218,10 @@ class SerenaDashboardAPI:
     @property
     def memory_log_handler(self) -> MemoryLogHandler:
         return self._memory_log_handler
+
+    def _active_project_name(self) -> str | None:
+        project = self._agent.get_active_project()
+        return project.project_name if project is not None else None
 
     def _setup_routes(self) -> None:
         @self._app.route("/")
@@ -363,6 +369,65 @@ class SerenaDashboardAPI:
                 return {"status": "success", "message": result_message}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
+
+        @self._app.route("/memory_sync/status", methods=["GET"])
+        def memory_sync_status() -> dict[str, Any]:
+            project = request.args.get("project")
+            if not project:
+                project = self._active_project_name()
+            summary = self._memory_sync.read_state()
+            current = self._memory_sync.current_run()
+            last = self._memory_sync.last_run()
+            return {
+                "status": "success",
+                "project": project,
+                "qdrant_memory_dir": str(self._memory_sync.qdrant_memory_dir),
+                "summary": summary.to_dict(),
+                "current_run": current.to_dict() if current else None,
+                "last_run": last.to_dict() if last else None,
+                "credentials_present": all(
+                    self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS
+                ),
+            }
+
+        @self._app.route("/memory_sync/trigger", methods=["POST"])
+        def memory_sync_trigger() -> dict[str, Any]:
+            data = request.get_json(silent=True) or {}
+            project = data.get("project") or self._active_project_name()
+            dry_run = bool(data.get("dry_run", False))
+            # Run on the agent's TaskExecutor so the HTTP request returns
+            # immediately; the operator polls /memory_sync/status to follow up.
+            self._agent.execute_task(
+                lambda: self._memory_sync.trigger_sync(project=project, dry_run=dry_run),
+                logged=True,
+                name=f"MemorySync[{project or 'global'}{', dry-run' if dry_run else ''}]",
+            )
+            return {"status": "success", "project": project, "dry_run": dry_run}
+
+        @self._app.route("/memory_sync/credentials", methods=["GET"])
+        def memory_sync_credentials_get() -> dict[str, Any]:
+            return {
+                "status": "success",
+                "scope": R2_SCOPE,
+                "required_keys": list(R2_REQUIRED_KEYS),
+                "values": self._memory_sync.get_r2_credentials_masked(),
+            }
+
+        @self._app.route("/memory_sync/credentials", methods=["PUT"])
+        def memory_sync_credentials_put() -> dict[str, Any]:
+            data = request.get_json(silent=True) or {}
+            values = data.get("values") or {}
+            if not isinstance(values, dict):
+                return {"status": "error", "message": "values must be an object"}
+            cleaned = {str(k): "" if v is None else str(v) for k, v in values.items()}
+            try:
+                self._memory_sync.set_r2_credentials(cleaned)
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+            return {
+                "status": "success",
+                "values": self._memory_sync.get_r2_credentials_masked(),
+            }
 
         @self._app.route("/get_serena_config", methods=["GET"])
         def get_serena_config() -> dict[str, Any]:
