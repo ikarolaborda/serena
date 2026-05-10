@@ -2249,11 +2249,16 @@ class Dashboard {
 }
 
 // ===== Memory Sync panel =====
-// Wired as a standalone IIFE to avoid touching the Dashboard class. The
+// Wired as a standalone block to avoid touching the Dashboard class. The
 // collapsible header behaviour is already attached at class level.
-(function setupMemorySyncPanel() {
+// jQuery's $(fn) defers until DOM-ready, which is required because
+// dashboard.js is loaded in <head>, before the panel elements exist.
+$(function setupMemorySyncPanel() {
     const $panel = $('#memory-sync-display');
-    if ($panel.length === 0) return;
+    if ($panel.length === 0) {
+        console.warn('[memory-sync] panel element not found; skipping wiring');
+        return;
+    }
 
     const $project = $('#memory-sync-project');
     const $lastPush = $('#memory-sync-last-push');
@@ -2348,13 +2353,54 @@ class Dashboard {
         });
     }
 
-    $('#memory-sync-refresh').on('click', function () { refreshStatus(); refreshCredentials(); });
+    $('#memory-sync-refresh').on('click', function () { refreshStatus(); refreshCredentials(); refreshRecent(); });
     $('#memory-sync-trigger').on('click', function () { trigger(false); });
     $('#memory-sync-dry-run').on('click', function () { trigger(true); });
     $('#memory-sync-save-creds').on('click', saveCredentials);
 
     // Lazy-load when the section is first expanded.
     $('#memory-sync-header').on('click', function () {
-        if ($panel.is(':visible')) { refreshStatus(); refreshCredentials(); }
+        if ($panel.is(':visible')) {
+            refreshStatus();
+            refreshCredentials();
+            refreshRecent();
+        }
     });
-})();
+
+    // Recent syncs (project-aware) — populated from /memory_sync/recent.
+    function refreshRecent() {
+        const $body = $('#memory-sync-recent-body');
+        if ($body.length === 0) return;
+        $.getJSON('/memory_sync/recent').done(function (data) {
+            $body.empty();
+            const events = (data && data.events) || [];
+            if (events.length === 0) {
+                $body.append($('<tr><td colspan="4" class="memory-sync-mask">No syncs recorded yet for this project.</td></tr>'));
+                return;
+            }
+            events.forEach(function (e) {
+                const row = $('<tr>');
+                row.append($('<td>').text((e.ts || '').replace('T', ' ').replace('Z', '')));
+                row.append($('<td>').text(e.outcome || '—'));
+                row.append($('<td>').text(e.source || '—'));
+                row.append($('<td>').addClass('memory-sync-mask').text(e.snapshot_id || ''));
+                $body.append(row);
+            });
+        });
+    }
+
+    // Re-poll status + recent every 10s while the panel is open so an
+    // external sync (Claude Code session in another project) becomes
+    // visible without the operator clicking refresh.
+    let pollTimer = null;
+    function startPolling() {
+        if (pollTimer !== null) return;
+        pollTimer = setInterval(function () {
+            if ($panel.is(':visible')) {
+                refreshStatus();
+                refreshRecent();
+            }
+        }, 10000);
+    }
+    startPolling();
+});

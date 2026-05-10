@@ -1410,3 +1410,8 @@ body {
 .memory-sync-creds input[type="password"] { width: 100%; box-sizing: border-box; }
 .memory-sync-note { font-size: 0.8em; color: var(--text-secondary, #777); margin-top: 6px; }
 .memory-sync-output { max-height: 200px; overflow: auto; font-size: 0.8em; background: var(--bg-secondary, #f5f5f5); padding: 6px; margin-top: 8px; white-space: pre-wrap; }
+
+.memory-sync-recent { margin-top: 12px; }
+.memory-sync-recent table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+.memory-sync-recent th, .memory-sync-recent td { padding: 3px 6px; border-bottom: 1px solid var(--border-color); text-align: left; }
+.memory-sync-recent td:last-child { font-family: monospace; color: var(--text-secondary, #777); word-break: break-all; }

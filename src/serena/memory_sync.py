@@ -35,6 +35,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from collections.abc import Callable
+
+from serena.memory_sync_history import MemorySyncHistory, MemorySyncWatcher
 from serena.util.atomic_io import atomic_write_text
 from serena.util.secrets_store import SecretsStore
 
@@ -108,6 +111,8 @@ class MemorySyncService:
         self,
         secrets_store: SecretsStore | None = None,
         qdrant_memory_dir: str | os.PathLike[str] | None = None,
+        history: MemorySyncHistory | None = None,
+        active_project_provider: Callable[[], str | None] | None = None,
     ) -> None:
         # Default to the encrypted store; tests can pass an explicit plain
         # SecretsStore via the keyword arg.
@@ -116,6 +121,14 @@ class MemorySyncService:
         self._lock = threading.Lock()
         self._last_run: SyncRunResult | None = None
         self._current_run: SyncRunResult | None = None
+        self._history = history if history is not None else MemorySyncHistory()
+        # The watcher needs to know which project to tag external syncs with.
+        # The dashboard wires this to the agent's active project; tests can
+        # pass an explicit provider.
+        self._active_project_provider: Callable[[], str | None] = (
+            active_project_provider if active_project_provider is not None else lambda: None
+        )
+        self._watcher: MemorySyncWatcher | None = None
 
     @staticmethod
     def _resolve_qdrant_dir(override: str | os.PathLike[str] | None) -> Path:
@@ -133,6 +146,28 @@ class MemorySyncService:
     @property
     def secrets(self) -> SecretsStore:
         return self._secrets
+
+    @property
+    def history(self) -> MemorySyncHistory:
+        return self._history
+
+    def start_watcher(self) -> None:
+        """Start polling the state file for externally-triggered syncs.
+
+        Idempotent; safe to call multiple times. Stops on agent shutdown
+        because the thread is daemon-flagged.
+        """
+        if self._watcher is None:
+            self._watcher = MemorySyncWatcher(
+                state_file=self._qdrant_dir / "data" / "r2-state.json",
+                history=self._history,
+                active_project_provider=self._active_project_provider,
+            )
+        self._watcher.start()
+
+    def stop_watcher(self) -> None:
+        if self._watcher is not None:
+            self._watcher.stop()
 
     # ---------- credentials ---------------------------------------------------
 
@@ -241,6 +276,31 @@ class MemorySyncService:
             with self._lock:
                 self._last_run = run
                 self._current_run = None
+            # Always record self-events: the operator wants the history to
+            # show failed/unavailable attempts too, not only successful pushes.
+            if self._watcher is not None:
+                self._watcher.record_self_event(
+                    project=run.project,
+                    snapshot_id=run.snapshot_id,
+                    outcome=run.outcome,
+                    notes=run.notes,
+                )
+            else:
+                # If the watcher is not started (e.g. headless test harness),
+                # still write to history directly so dashboards picking up
+                # later can see this attempt.
+                from serena.memory_sync_history import SyncEvent
+
+                self._history.append(
+                    SyncEvent(
+                        ts=run.finished_at or _utcnow_iso(),
+                        project=run.project,
+                        snapshot_id=run.snapshot_id,
+                        source="self",
+                        outcome=run.outcome,
+                        notes=run.notes,
+                    )
+                )
         return run
 
     def _validate_preconditions(self, run: SyncRunResult) -> None:

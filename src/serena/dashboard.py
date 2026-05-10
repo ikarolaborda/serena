@@ -209,7 +209,10 @@ class SerenaDashboardAPI:
         self._tool_usage_stats = tool_usage_stats
         self._loaded_news: dict[str, str] = {}
         self._news_ready = threading.Event()
-        self._memory_sync = MemorySyncService()
+        self._memory_sync = MemorySyncService(
+            active_project_provider=self._active_project_name,
+        )
+        self._memory_sync.start_watcher()
         self._setup_routes()
         self._read_news = ReadNews.load()
         # Fetch remote news in background on startup (non-blocking)
@@ -412,6 +415,29 @@ class SerenaDashboardAPI:
                 "scope": R2_SCOPE,
                 "required_keys": list(R2_REQUIRED_KEYS),
                 "values": self._memory_sync.get_r2_credentials_masked(),
+            }
+
+        @self._app.route("/memory_sync/recent", methods=["GET"])
+        def memory_sync_recent() -> dict[str, Any]:
+            # Project filter: explicit ?project=… wins; otherwise use the
+            # agent's active project. Pass ?project=all to disable filtering.
+            requested = request.args.get("project")
+            if requested == "all":
+                project_filter: str | None = None
+            elif requested:
+                project_filter = requested
+            else:
+                project_filter = self._active_project_name()
+            try:
+                limit = max(1, min(int(request.args.get("limit", "25")), 200))
+            except (TypeError, ValueError):
+                limit = 25
+            events = self._memory_sync.history.recent(project=project_filter, limit=limit)
+            return {
+                "status": "success",
+                "project": project_filter,
+                "count": len(events),
+                "events": [e.to_dict() for e in events],
             }
 
         @self._app.route("/memory_sync/credentials", methods=["PUT"])
