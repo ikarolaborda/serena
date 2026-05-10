@@ -2260,6 +2260,7 @@ class Dashboard {
     const $outcome = $('#memory-sync-outcome');
     const $current = $('#memory-sync-current');
     const $credsState = $('#memory-sync-creds-state');
+    const $encryption = $('#memory-sync-encryption');
     const $output = $('#memory-sync-last-output');
     const $credsTable = $('#memory-sync-creds-table tbody');
 
@@ -2285,6 +2286,8 @@ class Dashboard {
             const cur = data.current_run;
             $current.text(cur ? ('running — started ' + fmtTs(cur.started_at)) : 'idle');
             $credsState.text(data.credentials_present ? 'all required keys present' : 'missing — set them below');
+            const enc = data.encryption || '—';
+            $encryption.text(enc === 'plain' ? 'PLAIN — at-rest encryption disabled' : enc);
         }).fail(function (xhr) {
             $outcome.text('status error: ' + xhr.status);
         });

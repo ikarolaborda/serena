@@ -388,6 +388,7 @@ class SerenaDashboardAPI:
                 "credentials_present": all(
                     self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS
                 ),
+                "encryption": self._memory_sync.secrets.encryption_label,
             }
 
         @self._app.route("/memory_sync/trigger", methods=["POST"])

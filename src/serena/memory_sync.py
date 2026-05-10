@@ -109,7 +109,9 @@ class MemorySyncService:
         secrets_store: SecretsStore | None = None,
         qdrant_memory_dir: str | os.PathLike[str] | None = None,
     ) -> None:
-        self._secrets = secrets_store or SecretsStore()
+        # Default to the encrypted store; tests can pass an explicit plain
+        # SecretsStore via the keyword arg.
+        self._secrets = secrets_store if secrets_store is not None else SecretsStore.default()
         self._qdrant_dir = self._resolve_qdrant_dir(qdrant_memory_dir)
         self._lock = threading.Lock()
         self._last_run: SyncRunResult | None = None
