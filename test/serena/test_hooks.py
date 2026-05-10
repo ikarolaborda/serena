@@ -11,24 +11,36 @@ from click.testing import CliRunner
 from serena.hooks import (
     HookClient,
     PreToolUseAutoApproveSerenaHook,
-    PreToolUseRemindAboutSerenaHook,
+    PreToolUseRemindAboutSymbolicToolsHook,
     SessionEndCleanupHook,
-    SessionStartActivateProjectHook,
     hook_commands,
 )
 
-ToolUseCounter = PreToolUseRemindAboutSerenaHook.ToolUseCounter
+ToolUseCounter = PreToolUseRemindAboutSymbolicToolsHook.ToolUseCounter
 
 
 def _make_stdin(data: dict) -> StringIO:
     return StringIO(json.dumps(data))
 
 
-def _base_input(tool_name: str = "grep_search", session_id: str = "test-session-123") -> dict:
+def _base_input(
+    tool_name: str = "grep_search",
+    session_id: str = "test-session-123",
+    tool_input: dict | None = None,
+) -> dict:
     return {
         "session_id": session_id,
         "tool_name": tool_name,
-        "tool_input": {"query": "foo"},
+        "tool_input": tool_input if tool_input is not None else {"query": "foo"},
+    }
+
+
+def _read_input(tool_name: str = "read", session_id: str = "test-session-123", file_path: str = "src/foo.py") -> dict:
+    """Build a hook payload for a read-style tool call against a file."""
+    return {
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "tool_input": {"file_path": file_path},
     }
 
 
@@ -38,13 +50,13 @@ class TestHookClientDetection:
     def test_claude_code_client(self, tmp_path: Path):
         stdin_data = _base_input()
         with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            hook = PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
+            hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
         assert hook._client == HookClient.CLAUDE_CODE
 
     def test_vscode_client(self, tmp_path: Path):
         stdin_data = _base_input()
         with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            hook = PreToolUseRemindAboutSerenaHook(HookClient.VSCODE)
+            hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.VSCODE)
         assert hook._client == HookClient.VSCODE
 
 
@@ -55,37 +67,57 @@ class TestPreToolUseRemindAboutSerenaHook:
         stdin_data = {"session_id": "s1"}
         with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
             with pytest.raises(ValueError, match="Tool name is required"):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
 
     def test_missing_session_id_raises(self, tmp_path: Path):
         stdin_data = {"tool_name": "grep"}
         with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
             with pytest.raises(ValueError, match="Session ID is required"):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
 
     def test_grep_tool_detection_claude_code(self, tmp_path: Path):
         """Claude Code uses the exact tool name ``Grep`` (lowercased to ``grep``)."""
         for name, expected in [("grep", True), ("grep_search", False), ("mcp_grep", False), ("read", False)]:
             with patch("sys.stdin", _make_stdin(_base_input(tool_name=name))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                hook = PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
-            assert hook.is_grep_tool() == expected, f"is_grep_tool() wrong for {name} (claude-code)"
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
+            assert hook.is_grep_call() == expected, f"is_grep_tool() wrong for {name} (claude-code)"
 
     def test_grep_tool_detection_non_claude_code(self, tmp_path: Path):
         """Non-Claude-Code clients fall back to substring matching to cover verbose tool names."""
         for name, expected in [("grep_search", True), ("mcp_grep", True), ("read_file", False), ("serena_find", False)]:
             with patch("sys.stdin", _make_stdin(_base_input(tool_name=name))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                hook = PreToolUseRemindAboutSerenaHook(HookClient.VSCODE)
-            assert hook.is_grep_tool() == expected, f"is_grep_tool() wrong for {name} (vscode)"
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.VSCODE)
+            assert hook.is_grep_call() == expected, f"is_grep_tool() wrong for {name} (vscode)"
+
+    def test_grep_tool_detection_codex_shell_commands(self, tmp_path: Path):
+        """Codex shell-command tools are classified by the command embedded in their payload."""
+        cases = [
+            ("exec_command", {"cmd": "rg -n foo README.md"}, True),
+            ("functions.shell_command", {"command": "rg -n foo README.md"}, True),
+            ("functions.shell_command", {"command": "Get-Content README.md"}, False),
+        ]
+        for tool_name, tool_input, expected in cases:
+            with (
+                patch("sys.stdin", _make_stdin(_base_input(tool_name=tool_name, tool_input=tool_input))),
+                patch("serena.hooks.serena_home_dir", str(tmp_path)),
+            ):
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX)
+            assert hook.is_grep_call() == expected, f"is_grep_tool() wrong for {tool_name} / {tool_input}"
 
     def test_read_file_tool_detection_claude_code(self, tmp_path: Path):
         """Claude Code uses the exact tool name ``Read`` (lowercased to ``read``)."""
-        for name, expected in [("read", True), ("read_file", False), ("readFile", False), ("grep", False)]:
-            with patch("sys.stdin", _make_stdin(_base_input(tool_name=name))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                hook = PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
-            assert hook.is_read_file_tool() == expected, f"is_read_file_tool() wrong for {name} (claude-code)"
+        for name, expected in [("read", True), ("mcp__serena__read_file", True), ("grep", False), ("serena_search_for_pattern", False)]:
+            with (
+                patch("sys.stdin", _make_stdin(_read_input(tool_name=name))),
+                patch("serena.hooks.serena_home_dir", str(tmp_path)),
+            ):
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
+            assert hook.is_read_file_call() == expected, f"is_read_file_tool() wrong for {name} (claude-code)"
 
     def test_read_file_tool_detection_non_claude_code(self, tmp_path: Path):
-        """Non-Claude-Code clients accept any read-style verb (``read``/``view``/``open``/``show``) combined with ``file``."""
+        """Non-Claude-Code clients accept any read-style verb (``read``/``view``/``open``/``show``)
+        combined with ``file``.
+        """
         cases = [
             # canonical names
             ("read_file", True),
@@ -101,28 +133,68 @@ class TestPreToolUseRemindAboutSerenaHook:
             ("edit_file", False),
         ]
         for name, expected in cases:
-            with patch("sys.stdin", _make_stdin(_base_input(tool_name=name))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                hook = PreToolUseRemindAboutSerenaHook(HookClient.VSCODE)
-            assert hook.is_read_file_tool() == expected, f"is_read_file_tool() wrong for {name} (vscode)"
+            with (
+                patch("sys.stdin", _make_stdin(_read_input(tool_name=name))),
+                patch("serena.hooks.serena_home_dir", str(tmp_path)),
+            ):
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.VSCODE)
+            assert hook.is_read_file_call() == expected, f"is_read_file_tool() wrong for {name} (vscode)"
+
+    def test_read_non_code_file_counts_as_file_read(self, tmp_path: Path):
+        """A ``Read`` call against a non-source file still counts as a file read."""
+        payload = _read_input(tool_name="read", file_path="notes/todo.txt")
+        with patch("sys.stdin", _make_stdin(payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
+        assert hook.is_read_call() is True
+        assert hook.is_read_file_call() is True
+        assert hook.is_read_code_file_call() is False
+
+    def test_read_code_file_detection(self, tmp_path: Path):
+        """Only source-like read targets count for the code-read reminder."""
+        cases = [
+            (HookClient.CLAUDE_CODE, _read_input(tool_name="read", file_path="README.md"), False),
+            (HookClient.CLAUDE_CODE, _read_input(tool_name="read", file_path="src/foo.py"), True),
+            (HookClient.CODEX, _base_input("functions.shell_command", tool_input={"command": "Get-Content README.md"}), False),
+            (HookClient.CODEX, _base_input("functions.shell_command", tool_input={"command": "Get-Content src/foo.py"}), True),
+        ]
+        for client, payload, expected in cases:
+            with patch("sys.stdin", _make_stdin(payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                hook = PreToolUseRemindAboutSymbolicToolsHook(client)
+            assert hook.is_read_code_file_call() == expected, f"is_read_code_file_call() wrong for {client} / {payload}"
+
+    def test_read_file_tool_detection_codex_shell_commands(self, tmp_path: Path):
+        """Codex shell-command tools count PowerShell file reads, including non-code files."""
+        cases = [
+            ("exec_command", {"cmd": "cat README.md"}, True),
+            ("functions.shell_command", {"command": "Get-Content README.md"}, True),
+            ("functions.shell_command", {"command": "rg -n foo README.md"}, False),
+        ]
+        for tool_name, tool_input, expected in cases:
+            with (
+                patch("sys.stdin", _make_stdin(_base_input(tool_name=tool_name, tool_input=tool_input))),
+                patch("serena.hooks.serena_home_dir", str(tmp_path)),
+            ):
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX)
+            assert hook.is_read_file_call() == expected, f"is_read_file_tool() wrong for {tool_name} / {tool_input}"
 
     def test_serena_tool_detection(self, tmp_path: Path):
         for name, expected in [("mcp_serena_find_symbol", True), ("serena_overview", True), ("grep_search", False)]:
             with patch("sys.stdin", _make_stdin(_base_input(tool_name=name))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                hook = PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE)
-            assert hook.is_serena_tool() == expected, f"is_serena_tool() wrong for {name}"
+                hook = PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE)
+            assert hook.is_serena_symbolic_tool() == expected, f"is_serena_tool() wrong for {name}"
 
     def test_no_output_below_threshold(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Below the threshold, the hook should produce no output (tool is allowed)."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD - 1):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
         assert capsys.readouterr().out == ""
 
     def test_deny_output_after_threshold_greps_claude_code(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """After reaching the grep threshold, the hook should output a deny."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         output = capsys.readouterr().out.strip()
         result = json.loads(output)
@@ -134,7 +206,7 @@ class TestPreToolUseRemindAboutSerenaHook:
         """After reaching the grep threshold, the hook should output a deny for VS Code."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep_search"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.VSCODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.VSCODE).execute()
 
         output = capsys.readouterr().out.strip()
         result = json.loads(output)
@@ -142,29 +214,69 @@ class TestPreToolUseRemindAboutSerenaHook:
         assert hook_output["permissionDecision"] == "deny"
         assert "grep" in hook_output["additionalContext"].lower()
 
-    def test_deny_output_after_threshold_reads(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """After reaching the read file threshold, the hook should output a deny."""
-        for _ in range(ToolUseCounter._READ_FILE_USES_THRESHOLD):
-            with patch("sys.stdin", _make_stdin(_base_input("read"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+    def test_deny_output_after_threshold_greps_codex_shell_command(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """After reaching the grep threshold, Codex ``functions.shell_command`` emits a deny."""
+        payload = _base_input("functions.shell_command", tool_input={"command": "rg -n foo README.md"})
+        for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
+            with patch("sys.stdin", _make_stdin(payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
 
         output = capsys.readouterr().out.strip()
         result = json.loads(output)
         hook_output = result["hookSpecificOutput"]
         assert hook_output["permissionDecision"] == "deny"
-        assert "read file" in hook_output["additionalContext"].lower()
+        assert "additionalContext" not in hook_output
+        assert "grep" in hook_output["permissionDecisionReason"].lower()
+
+    def test_deny_output_after_threshold_reads(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """After reaching the read file threshold, the hook should output a deny.
+
+        ``_read_input`` supplies the direct ``file_path`` field emitted by file-read tools.
+        """
+        for _ in range(ToolUseCounter._READ_FILE_USES_THRESHOLD):
+            with patch("sys.stdin", _make_stdin(_read_input("read"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
+
+        output = capsys.readouterr().out.strip()
+        result = json.loads(output)
+        hook_output = result["hookSpecificOutput"]
+        assert hook_output["permissionDecision"] == "deny"
+        assert "read" in hook_output["additionalContext"].lower()
+        assert "files" in hook_output["additionalContext"].lower()
+
+    def test_no_deny_after_threshold_get_content_markdown_codex(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """PowerShell ``Get-Content`` calls on markdown files do not count for the code-read reminder."""
+        payload = _base_input("functions.shell_command", tool_input={"command": "Get-Content README.md"})
+        for _ in range(ToolUseCounter._READ_FILE_USES_THRESHOLD):
+            with patch("sys.stdin", _make_stdin(payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+
+        assert capsys.readouterr().out == ""
+
+    def test_deny_output_after_threshold_get_content_code_file_codex(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """PowerShell ``Get-Content`` calls on source files count for the code-read reminder."""
+        payload = _base_input("functions.shell_command", tool_input={"command": "Get-Content src/foo.py"})
+        for _ in range(ToolUseCounter._READ_FILE_USES_THRESHOLD):
+            with patch("sys.stdin", _make_stdin(payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+
+        result = json.loads(capsys.readouterr().out.strip())
+        hook_output = result["hookSpecificOutput"]
+        assert hook_output["permissionDecision"] == "deny"
+        assert "additionalContext" not in hook_output
+        assert "read" in hook_output["permissionDecisionReason"].lower()
 
     def test_serena_tool_resets_counters(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Using a Serena tool should reset counters, so the threshold is not reached."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD - 1):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         with patch("sys.stdin", _make_stdin(_base_input("mcp_serena_find_symbol"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         assert capsys.readouterr().out == ""
 
@@ -172,11 +284,11 @@ class TestPreToolUseRemindAboutSerenaHook:
         """After a deny is emitted, the counter is reset so the next burst starts fresh."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
         capsys.readouterr()
 
         with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         assert capsys.readouterr().out == ""
 
@@ -187,12 +299,12 @@ class TestPreToolUseRemindAboutSerenaHook:
         # first burst: should emit a deny
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
         first_output = capsys.readouterr().out.strip()
         assert first_output, "first burst should have emitted a deny"
 
         # snapshot the persisted counter immediately after the deny was emitted
-        stub_for_path = object.__new__(PreToolUseRemindAboutSerenaHook)
+        stub_for_path = object.__new__(PreToolUseRemindAboutSymbolicToolsHook)
         stub_for_path.session_persistence_dir = str(tmp_path / "hook_data" / _base_input()["session_id"])
         counter_before = ToolUseCounter.load(stub_for_path)
 
@@ -200,7 +312,7 @@ class TestPreToolUseRemindAboutSerenaHook:
         # hook must short-circuit — no deny output and no counter mutation
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         assert capsys.readouterr().out == ""
 
@@ -212,11 +324,11 @@ class TestPreToolUseRemindAboutSerenaHook:
         # first burst: emits a deny
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
         capsys.readouterr()
 
         # backdate the persisted last_deny_timestamp so the rate-limit window has expired
-        stub_for_path = object.__new__(PreToolUseRemindAboutSerenaHook)
+        stub_for_path = object.__new__(PreToolUseRemindAboutSymbolicToolsHook)
         stub_for_path.session_persistence_dir = str(tmp_path / "hook_data" / _base_input()["session_id"])
         counter = ToolUseCounter.load(stub_for_path)
         assert counter.last_deny_timestamp is not None
@@ -226,7 +338,7 @@ class TestPreToolUseRemindAboutSerenaHook:
         # second burst should now emit a deny again
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
             with patch("sys.stdin", _make_stdin(_base_input("grep"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-                PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         second_output = capsys.readouterr().out.strip()
         assert second_output, "after the rate-limit window elapsed, a new burst should emit a deny"
@@ -248,14 +360,14 @@ class TestPreToolUseRemindAboutSerenaHook:
             last_read_file_use_timestamp=datetime.now(),
             last_non_symbolic_use_timestamp=datetime.now(),
         )
-        stub_for_path = object.__new__(PreToolUseRemindAboutSerenaHook)
+        stub_for_path = object.__new__(PreToolUseRemindAboutSymbolicToolsHook)
         stub_for_path.session_persistence_dir = str(session_dir)
         counter.save(stub_for_path)
 
         # invoke execute with a neutral (non-grep, non-read, non-serena) tool so that
         # update() leaves the counters untouched and the fall-through branch is taken
         with patch("sys.stdin", _make_stdin(_base_input("Edit"))), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            PreToolUseRemindAboutSerenaHook(HookClient.CLAUDE_CODE).execute()
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CLAUDE_CODE).execute()
 
         output = capsys.readouterr().out.strip()
         assert output, "expected a non-symbolic deny to be emitted"
@@ -298,7 +410,7 @@ class TestToolUseCounter:
         counter.last_read_file_use_timestamp = now - timedelta(seconds=1)
         counter.n_recent_read_file_uses = 1
 
-        hook = self._make_hook_stub("read_file", now)
+        hook = self._make_hook_stub("read_file", now, file_path="src/foo.py")
         counter.update(hook)
 
         assert counter.n_recent_read_file_uses == 2
@@ -309,10 +421,21 @@ class TestToolUseCounter:
         counter.last_read_file_use_timestamp = now - timedelta(seconds=ToolUseCounter._READ_FILE_RESET_PERIOD_SECONDS + 1)
         counter.n_recent_read_file_uses = 2
 
-        hook = self._make_hook_stub("read_file", now)
+        hook = self._make_hook_stub("read_file", now, file_path="src/foo.py")
         counter.update(hook)
 
         assert counter.n_recent_read_file_uses == 1
+
+    def test_update_ignores_read_of_non_code_file(self):
+        """A read call whose payload points at a non-source file does not increment the code-read counter."""
+        counter = ToolUseCounter()
+        now = datetime.now()
+
+        hook = self._make_hook_stub("read_file", now, file_path="notes/todo.txt")
+        counter.update(hook)
+
+        assert counter.n_recent_read_file_uses == 0
+        assert counter.last_read_file_use_timestamp is None
 
     def test_serena_tool_resets_all_counters(self):
         counter = ToolUseCounter(
@@ -394,23 +517,37 @@ class TestToolUseCounter:
         assert counter.last_deny_timestamp == base
 
     @staticmethod
-    def _make_hook_stub(tool_name: str, timestamp: datetime) -> PreToolUseRemindAboutSerenaHook:
+    def _make_hook_stub(
+        tool_name: str,
+        timestamp: datetime,
+        file_path: str | None = None,
+        command_args_str: str | None = None,
+    ) -> PreToolUseRemindAboutSymbolicToolsHook:
         """Create a minimal stub that satisfies ToolUseCounter.update without reading stdin.
 
         Uses ``HookClient.VSCODE`` so that ``is_grep_tool`` / ``is_read_file_tool`` apply the
         substring-matching branch — the counter tests below feed verbose tool names like
         ``grep_search`` / ``read_file`` which are only recognized under the non-Claude-Code
         branch (Claude Code uses exact names ``grep`` / ``read``).
+
+        :param file_path: optional payload path; the hook classifies read-style tools as
+            file reads regardless of the path extension.
+        :param command_args_str: optional shell-argument tail; equivalent to ``file_path`` but
+            populates the ``cmd``-derived field instead of ``file_path``.
         """
-        stub = object.__new__(PreToolUseRemindAboutSerenaHook)
+        stub = object.__new__(PreToolUseRemindAboutSymbolicToolsHook)
         stub._tool_name = tool_name.lower()
         stub._client = HookClient.VSCODE
         stub.triggered_at_timestamp = timestamp
+        stub._command = None
+        stub._command_name = None
+        stub._command_args_str = command_args_str
+        stub._file_path = file_path
         return stub
 
 
 class TestPreToolUseAutoApproveSerenaHook:
-    """Tests for the auto-approve hook that allows Serena tools while the client is in ``acceptEdits`` mode."""
+    """Tests for the auto-approve hook that allows Serena tools while the client is in a permissive permission mode (``acceptEdits`` or ``auto``)."""
 
     @staticmethod
     def _approve_input(
@@ -440,6 +577,27 @@ class TestPreToolUseAutoApproveSerenaHook:
         assert hook_output["hookEventName"] == "PreToolUse"
         assert hook_output["permissionDecision"] == "allow"
         assert "acceptedits" in hook_output["permissionDecisionReason"].lower()
+
+    def test_approves_serena_tool_in_auto_mode(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """When the tool is a Serena tool and the mode is ``auto``, an allow decision is emitted.
+
+        Claude Code's ``auto`` mode is the hands-off-execution mode users adopt for autonomous
+        runs; Serena tool calls should be auto-approved there for the same reason as in
+        ``acceptEdits`` (Serena's destructive tools would otherwise still prompt per call).
+        """
+        stdin_data = self._approve_input(permission_mode="auto")
+        with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseAutoApproveSerenaHook(HookClient.CLAUDE_CODE).execute()
+
+        output = capsys.readouterr().out.strip()
+        result = json.loads(output)
+        hook_output = result["hookSpecificOutput"]
+        assert hook_output["hookEventName"] == "PreToolUse"
+        assert hook_output["permissionDecision"] == "allow"
+        # the reason must identify the actual mode that triggered the approval, not just say
+        # "auto-approved" — the substring " auto " (with surrounding spaces) discriminates the
+        # mode name from the unrelated "Auto-approved" prefix.
+        assert " auto " in hook_output["permissionDecisionReason"]
 
     def test_accepts_camel_case_permission_mode(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """The hook also reads the ``permissionMode`` (camelCase) variant of the field."""
@@ -471,25 +629,33 @@ class TestPreToolUseAutoApproveSerenaHook:
             PreToolUseAutoApproveSerenaHook(HookClient.CLAUDE_CODE).execute()
         assert capsys.readouterr().out == ""
 
+    def test_stays_silent_in_bypass_permissions_mode(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """``bypassPermissions`` already approves everything upstream in Claude Code, so the
+        hook deliberately does not emit an explicit allow there — it stays silent.
+
+        This test pins that boundary: only ``acceptEdits`` and ``auto`` are active modes for the
+        hook; expanding it further requires a deliberate change here.
+        """
+        stdin_data = self._approve_input(permission_mode="bypassPermissions")
+        with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseAutoApproveSerenaHook(HookClient.CLAUDE_CODE).execute()
+        assert capsys.readouterr().out == ""
+
+    def test_stays_silent_in_dont_ask_mode(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """``dontAsk`` is the user's deny-by-default posture (auto-deny unless allow-listed);
+        the hook honors that choice and stays silent rather than overriding it.
+        """
+        stdin_data = self._approve_input(permission_mode="dontAsk")
+        with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseAutoApproveSerenaHook(HookClient.CLAUDE_CODE).execute()
+        assert capsys.readouterr().out == ""
+
     def test_stays_silent_when_permission_mode_missing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """If ``permission_mode`` is missing from the input, the hook stays silent rather than erroring."""
         stdin_data = self._approve_input(permission_mode=None)
         with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
             PreToolUseAutoApproveSerenaHook(HookClient.CLAUDE_CODE).execute()
         assert capsys.readouterr().out == ""
-
-
-class TestSessionStartActivateProjectHook:
-    def test_outputs_activation_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        stdin_data = {"session_id": "s1"}
-        with patch("sys.stdin", _make_stdin(stdin_data)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            SessionStartActivateProjectHook(HookClient.VSCODE).execute()
-
-        output = capsys.readouterr().out.strip()
-        result = json.loads(output)
-        context = result["hookSpecificOutput"]["additionalContext"]
-        assert "Activate" in context
-        assert "Serena Instructions Manual" in context
 
 
 class TestSessionEndCleanupHook:
@@ -514,15 +680,6 @@ class TestSessionEndCleanupHook:
 
 class TestHookCli:
     """Tests for the Click CLI entry point (serena-hooks)."""
-
-    def test_activate_command(self, tmp_path: Path):
-        stdin_json = json.dumps({"session_id": "cli-test"})
-        runner = CliRunner()
-        with patch("serena.hooks.serena_home_dir", str(tmp_path)):
-            result = runner.invoke(hook_commands, ["activate", "--client", "vscode"], input=stdin_json)
-        assert result.exit_code == 0
-        output = json.loads(result.output)
-        assert "Activate" in output["hookSpecificOutput"]["additionalContext"]
 
     def test_cleanup_command(self, tmp_path: Path):
         session_dir = tmp_path / "hook_data" / "cli-cleanup"
@@ -556,6 +713,23 @@ class TestHookCli:
                 "tool_name": "mcp__serena__find_symbol",
                 "tool_input": {},
                 "permission_mode": "acceptEdits",
+            }
+        )
+        runner = CliRunner()
+        with patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            result = runner.invoke(hook_commands, ["auto-approve", "--client", "claude-code"], input=stdin_json)
+        assert result.exit_code == 0
+        output = json.loads(result.output)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    def test_auto_approve_command_in_auto_mode(self, tmp_path: Path):
+        """The ``auto-approve`` CLI command emits an allow for a Serena tool in ``auto`` mode."""
+        stdin_json = json.dumps(
+            {
+                "session_id": "cli-auto-approve-auto-mode",
+                "tool_name": "mcp__serena__find_symbol",
+                "tool_input": {},
+                "permission_mode": "auto",
             }
         )
         runner = CliRunner()

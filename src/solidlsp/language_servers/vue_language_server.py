@@ -21,7 +21,7 @@ from solidlsp.language_servers.typescript_language_server import (
     TypeScriptLanguageServer,
     prefer_non_node_modules_definition,
 )
-from solidlsp.ls import LSPFileBuffer, SolidLanguageServer
+from solidlsp.ls import LanguageServerDependencyProvider, LSPFileBuffer, SolidLanguageServer
 from solidlsp.ls_config import FilenameMatcher, Language, LanguageServerConfig
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_types import Location
@@ -54,12 +54,26 @@ class VueTypeScriptServer(TypeScriptLanguageServer):
         return Language.VUE.get_source_fn_matcher()
 
     class DependencyProvider(TypeScriptLanguageServer.DependencyProvider):
-        override_ts_ls_executable: str | None = None
+        """Dependency provider that returns a pre-resolved executable path.
 
+        The Vue LS install (run by ``VueLanguageServer._setup_runtime_dependencies``)
+        already locates the ``typescript-language-server`` binary alongside the Vue
+        language server, so the companion does not need to perform another install
+        lookup — it just returns the path it was constructed with.
+        """
+
+        def __init__(
+            self,
+            custom_settings: SolidLSPSettings.CustomLSSettings,
+            ls_resources_dir: str,
+            explicit_executable_path: str,
+        ) -> None:
+            super().__init__(custom_settings, ls_resources_dir)
+            self._explicit_executable_path = explicit_executable_path
+
+        @override
         def _get_or_install_core_dependency(self) -> str:
-            if self.override_ts_ls_executable is not None:
-                return self.override_ts_ls_executable
-            return super()._get_or_install_core_dependency()
+            return self._explicit_executable_path
 
     @override
     def _get_language_id_for_file(self, relative_file_path: str) -> str:
@@ -90,9 +104,21 @@ class VueTypeScriptServer(TypeScriptLanguageServer):
     ):
         self._vue_plugin_path = vue_plugin_path
         self._custom_tsdk_path = tsdk_path
-        VueTypeScriptServer.DependencyProvider.override_ts_ls_executable = ts_ls_executable_path
+        # Stored as instance state so the override survives across concurrent
+        # constructions of multiple VueLanguageServer instances. The class
+        # attribute pattern this replaces was racy: two parallel constructors
+        # could see each other's value in the brief window between assignment
+        # and reset.
+        self._explicit_ts_ls_executable = ts_ls_executable_path
         super().__init__(config, repository_root_path, solidlsp_settings)
-        VueTypeScriptServer.DependencyProvider.override_ts_ls_executable = None
+
+    @override
+    def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
+        return self.DependencyProvider(
+            self._custom_settings,
+            self._ls_resources_dir,
+            self._explicit_ts_ls_executable,
+        )
 
     @override
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
@@ -426,6 +452,18 @@ class VueLanguageServer(SolidLanguageServer):
         with self._ts_server.open_file(relative_file_path):
             return self._ts_server.request_rename_symbol_edit(relative_file_path, line, column, new_name)
 
+    @override
+    def request_text_document_diagnostics(
+        self,
+        relative_file_path: str,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int = 4,
+    ) -> list[ls_types.Diagnostic]:
+        self._ensure_ls_operational()
+        assert self._ts_server is not None
+        return self._ts_server.request_text_document_diagnostics(relative_file_path, start_line, end_line, min_severity)
+
     def _forward_edit_to_ts_server_if_needed(self, relative_file_path: str, edit_fn: Callable[[], object]) -> None:
         """
         Calls ``edit_fn`` on the TypeScript server if the file is open there.
@@ -598,6 +636,7 @@ class VueLanguageServer(SolidLanguageServer):
                     "signatureHelp": {"dynamicRegistration": True},
                     "codeAction": {"dynamicRegistration": True},
                     "rename": {"dynamicRegistration": True, "prepareSupport": True},
+                    "publishDiagnostics": {"relatedInformation": True},
                 },
                 "workspace": {
                     "workspaceFolders": True,

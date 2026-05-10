@@ -13,8 +13,8 @@ from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from copy import copy
 from pathlib import Path, PurePath
-from time import perf_counter, sleep
-from typing import Self, Union, cast
+from time import monotonic, perf_counter, sleep
+from typing import Any, Self, Union, cast
 
 import pathspec
 from sensai.util.pickle import getstate, load_pickle
@@ -487,10 +487,14 @@ class SolidLanguageServer(ABC):
 
         :param config: the global SolidLSP configuration.
         :param repository_root_path: the root path of the repository.
-        :param process_launch_info: (DEPRECATED - implement _create_dependency_provider instead)
+        :param process_launch_info: (DEPRECATED: pass None and implement _create_dependency_provider instead)
             the command used to start the actual language server.
             The command must pass appropriate flags to the binary, so that it runs in the stdio mode,
             as opposed to HTTP, TCP modes supported by some language servers.
+        :param language_id: The language identifier which will be passed to the language server in the `textDocument/didOpen`
+            notification by default.
+            If the language server uses multiple language identifiers, it must override the method `get_language_id_for_file`
+            to provide the appropriate identifier for each type of file.
         :param cache_version_raw_document_symbols: the version, for caching, of the raw document symbols coming
             from this specific language server. This should be incremented by subclasses calling this constructor
             whenever the format of the raw document symbols changes (typically because the language server
@@ -511,6 +515,10 @@ class SolidLanguageServer(ABC):
         self.language_id = language_id
         self.open_file_buffers: dict[str, LSPFileBuffer] = {}
         self.language = Language(language_id)
+        self._published_diagnostics: dict[str, list[ls_types.Diagnostic]] = {}
+        self._published_diagnostics_generation_by_uri: dict[str, int] = {}
+        self._published_diagnostics_generation = 0
+        self._published_diagnostics_condition = threading.Condition()
 
         # initialise symbol caches
         self.cache_dir = Path(self._solidlsp_settings.project_data_path) / self.CACHE_FOLDER_NAME / self.language_id
@@ -550,6 +558,7 @@ class SolidLanguageServer(ABC):
             logger=logging_fn,
             start_independent_lsp_process=config.start_independent_lsp_process,
         )
+        self.server.on_any_notification(self._observe_server_notification)
 
         # Set up the pathspec matcher for the ignored paths
         # for all absolute paths in ignored_paths, convert them to relative paths
@@ -566,6 +575,411 @@ class SolidLanguageServer(ABC):
         self._request_timeout: float | None = None
 
         self._has_waited_for_cross_file_references = False
+
+        # resolving additional workspace folders
+        self._additional_workspace_abs_paths: list[str] = []
+        _seen: set[str] = set()
+        for additional_workspace_path in self._solidlsp_settings.additional_workspace_folders:
+            if not additional_workspace_path or additional_workspace_path == ".":
+                continue
+            if not os.path.isabs(additional_workspace_path):
+                additional_workspace_abs_path = os.path.realpath(os.path.join(self.repository_root_path, additional_workspace_path))
+            else:
+                additional_workspace_abs_path = str(Path(additional_workspace_path).resolve())
+            if not os.path.isdir(additional_workspace_abs_path):
+                log.error(
+                    "additional_workspace_folders: skipping non-existent directory %s (resolved to %s)",
+                    additional_workspace_abs_path,
+                    additional_workspace_abs_path,
+                )
+                continue
+            if additional_workspace_abs_path in _seen:
+                log.info("additional_workspace_folders: skipping duplicate %s", additional_workspace_path)
+                continue
+            _seen.add(additional_workspace_abs_path)
+            self._additional_workspace_abs_paths.append(additional_workspace_abs_path)
+
+    def _observe_server_notification(self, method: str, params: Any) -> None:
+        """
+        Observe notifications sent by the language server.
+
+        This is used for generic cross-language bookkeeping that must work independently of
+        language-specific notification handlers.
+        """
+        if method == "textDocument/publishDiagnostics":
+            self._store_published_diagnostics(params)
+
+    def _store_published_diagnostics(self, params: Any) -> None:
+        """
+        Store diagnostics received through ``textDocument/publishDiagnostics``.
+        """
+        if not isinstance(params, dict):
+            return
+
+        uri = params.get("uri")
+        diagnostics = params.get("diagnostics")
+        if not isinstance(uri, str) or not isinstance(diagnostics, list):
+            return
+
+        normalized_diagnostics: list[ls_types.Diagnostic] = []
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+            if "message" not in diagnostic or "range" not in diagnostic:
+                continue
+
+            normalized_diagnostic: ls_types.Diagnostic = {
+                "uri": uri,
+                "message": diagnostic["message"],
+                "range": diagnostic["range"],
+            }
+            severity = diagnostic.get("severity")
+            if isinstance(severity, int):
+                normalized_diagnostic["severity"] = ls_types.DiagnosticSeverity(severity)
+
+            code = diagnostic.get("code")
+            if isinstance(code, int | str):
+                normalized_diagnostic["code"] = code
+
+            if "source" in diagnostic:
+                normalized_diagnostic["source"] = diagnostic["source"]
+            normalized_diagnostics.append(ls_types.Diagnostic(**normalized_diagnostic))
+
+        # canonicalize the key so lookups using URIs produced by pathlib.Path.as_uri() match
+        # what servers publish (e.g. file:///c%3A/... or file:///c:/... vs. file:///C:/...)
+        key = self._canonicalize_published_diagnostics_uri(uri)
+
+        with self._published_diagnostics_condition:
+            self._published_diagnostics_generation += 1
+            self._published_diagnostics[key] = normalized_diagnostics
+            self._published_diagnostics_generation_by_uri[key] = self._published_diagnostics_generation
+            self._published_diagnostics_condition.notify_all()
+
+    @staticmethod
+    def _canonicalize_published_diagnostics_uri(uri: str) -> str:
+        """
+        Canonicalizes a ``file://`` URI so that diagnostics published by language servers
+        and lookups based on ``pathlib.Path.as_uri()`` agree on the same key.
+
+        On Windows, servers may publish under ``file:///c%3A/...`` or ``file:///c:/...`` while
+        ``pathlib.Path.as_uri()`` produces ``file:///C:/...``. The canonical form uses an
+        upper-case drive letter and a plain colon.
+        """
+        if os.name != "nt" or not uri.startswith("file:///"):
+            return uri
+
+        # extract the segment after "file:///" up to the next slash and look for a drive letter
+        prefix = "file:///"
+        rest = uri[len(prefix) :]
+        slash = rest.find("/")
+        head = rest if slash < 0 else rest[:slash]
+        tail = "" if slash < 0 else rest[slash:]
+
+        if (len(head) >= 2 and head[0].isalpha() and head[1] == ":") or (
+            len(head) >= 4 and head[0].isalpha() and head[1:4].lower() == "%3a"
+        ):
+            head = head[0].upper() + ":"
+        else:
+            return uri
+
+        return prefix + head + tail
+
+    def _get_published_diagnostics_generation(self, uri: str) -> int:
+        key = self._canonicalize_published_diagnostics_uri(uri)
+        with self._published_diagnostics_condition:
+            return self._published_diagnostics_generation_by_uri.get(key, -1)
+
+    def _wait_for_published_diagnostics(
+        self,
+        uri: str,
+        after_generation: int,
+        timeout: float,
+    ) -> list[ls_types.Diagnostic] | None:
+        key = self._canonicalize_published_diagnostics_uri(uri)
+        deadline = perf_counter() + timeout
+        with self._published_diagnostics_condition:
+            while True:
+                current_generation = self._published_diagnostics_generation_by_uri.get(key, -1)
+                if current_generation > after_generation:
+                    return list(self._published_diagnostics.get(key, []))
+
+                remaining_timeout = deadline - perf_counter()
+                if remaining_timeout <= 0:
+                    return None
+                self._published_diagnostics_condition.wait(timeout=remaining_timeout)
+
+    def _get_cached_published_diagnostics(self, uri: str) -> list[ls_types.Diagnostic] | None:
+        key = self._canonicalize_published_diagnostics_uri(uri)
+        with self._published_diagnostics_condition:
+            diagnostics = self._published_diagnostics.get(key)
+            if diagnostics is None:
+                return None
+            return list(diagnostics)
+
+    @staticmethod
+    def _diagnostic_matches_range(diagnostic: ls_types.Diagnostic, start_line: int, end_line: int) -> bool:
+        diagnostic_start_line = diagnostic["range"]["start"]["line"]
+        diagnostic_end_line = diagnostic["range"]["end"]["line"]
+
+        # normalize inverted ranges: some servers (e.g. Julia's JuliaSyntax.jl for unterminated
+        # expressions) emit diagnostics whose end position lies before the start position.
+        # treat such ranges as a single span covering both lines.
+        lo = min(diagnostic_start_line, diagnostic_end_line)
+        hi = max(diagnostic_start_line, diagnostic_end_line)
+
+        # when end_line < 0 the caller imposes no upper bound; only enforce the lower bound.
+        if end_line < 0:
+            return hi >= start_line
+        return lo <= end_line and hi >= start_line
+
+    @staticmethod
+    def _diagnostic_matches_min_severity(diagnostic: ls_types.Diagnostic, min_severity: int) -> bool:
+        severity = diagnostic.get("severity")
+        if severity is None:
+            return True
+        return int(severity) <= min_severity
+
+    @classmethod
+    def _filter_diagnostics(
+        cls,
+        diagnostics: list[ls_types.Diagnostic],
+        start_line: int,
+        end_line: int,
+        min_severity: int,
+    ) -> list[ls_types.Diagnostic]:
+        diagnostics = [d for d in diagnostics if cls._diagnostic_matches_range(d, start_line, end_line)]
+        diagnostics = [d for d in diagnostics if cls._diagnostic_matches_min_severity(d, min_severity)]
+        return diagnostics
+
+    def _validate_text_document_diagnostics_request(
+        self,
+        relative_file_path: str,
+        start_line: int,
+        end_line: int,
+        min_severity: int,
+    ) -> str:
+        if not self.server_started:
+            log.error("request_text_document_diagnostics called before Language Server started")
+            raise SolidLSPException("Language Server not started")
+        if start_line < 0:
+            raise ValueError(f"start_line must be non-negative, got {start_line}")
+        if end_line != -1 and end_line < start_line:
+            raise ValueError(f"end_line must be -1 or >= start_line, got {end_line} < {start_line}")
+        if min_severity not in {1, 2, 3, 4}:
+            raise ValueError(f"min_severity must be one of 1, 2, 3, 4, got {min_severity}")
+        return pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
+
+    def get_published_diagnostics_generation(self, relative_file_path: str) -> int:
+        """
+        Get the generation number for the latest published diagnostics of a file.
+
+        :param relative_file_path: The relative path of the file.
+        :return: the generation number, or ``-1`` if none were published yet.
+        """
+        uri = pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
+        return self._get_published_diagnostics_generation(uri)
+
+    def get_cached_published_text_document_diagnostics(
+        self,
+        relative_file_path: str,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int = 4,
+    ) -> list[ls_types.Diagnostic] | None:
+        """
+        Get cached diagnostics received through ``textDocument/publishDiagnostics``.
+
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for.
+        :param start_line: the first 0-based line to include in the result.
+        :param end_line: the last 0-based line to include in the result. ``-1`` means no upper bound.
+        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+            Diagnostics with lower-or-equal numeric severity are returned.
+        :return: the cached diagnostics, or ``None`` if no diagnostics were published yet.
+        """
+        uri = self._validate_text_document_diagnostics_request(relative_file_path, start_line, end_line, min_severity)
+        diagnostics = self._get_cached_published_diagnostics(uri)
+        if diagnostics is None:
+            return None
+        return self._filter_diagnostics(diagnostics, start_line, end_line, min_severity)
+
+    def request_published_text_document_diagnostics(
+        self,
+        relative_file_path: str,
+        after_generation: int = -1,
+        timeout: float = 2.5,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int = 4,
+        allow_cached: bool = True,
+    ) -> list[ls_types.Diagnostic] | None:
+        """
+        Wait for diagnostics received through ``textDocument/publishDiagnostics`` and return them.
+
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for.
+        :param after_generation: only return diagnostics published after this generation. ``-1`` accepts the next publication.
+        :param timeout: the maximum time to wait for a newer publication.
+        :param start_line: the first 0-based line to include in the result.
+        :param end_line: the last 0-based line to include in the result. ``-1`` means no upper bound.
+        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+            Diagnostics with lower-or-equal numeric severity are returned.
+        :param allow_cached: whether to fall back to the current cached diagnostics if no newer publication arrives in time.
+        :return: the published diagnostics, or ``None`` if no diagnostics are available.
+        """
+        uri = self._validate_text_document_diagnostics_request(relative_file_path, start_line, end_line, min_severity)
+        published_uri = self._get_published_diagnostics_uri(uri)
+        diagnostics: list[ls_types.Diagnostic] | None = None
+
+        # keeping the document open
+        with self.open_file(relative_file_path):
+            diagnostics = self._wait_for_relevant_published_diagnostics(
+                uri=published_uri,
+                after_generation=after_generation,
+                timeout=timeout,
+                allow_cached=allow_cached,
+            )
+
+        if diagnostics is None:
+            return None
+
+        return self._filter_diagnostics(diagnostics, start_line, end_line, min_severity)
+
+    def _get_published_diagnostics_uri(self, request_uri: str) -> str:
+        """
+        Gets the URI under which published diagnostics should be looked up.
+        """
+        return request_uri
+
+    def _supports_pull_diagnostics(self) -> bool:
+        """
+        Whether the language server handles ``textDocument/diagnostic`` (LSP 3.17 pull
+        diagnostics) gracefully. Subclasses should override and return ``False`` when the
+        underlying server does not implement pull diagnostics, especially when sending
+        the request would terminate the server (e.g. LanguageServer.jl raises an error
+        for unknown methods that crashes the process).
+        """
+        return True
+
+    def _get_published_diagnostics_wait_timeout(self, pull_diagnostics_failed: bool) -> float:
+        """
+        Gets the timeout for waiting on published diagnostics after a diagnostics request.
+        """
+        return 2.5
+
+    def _accept_published_diagnostics(self, diagnostics: list[ls_types.Diagnostic]) -> bool:
+        """
+        Determines whether a published diagnostics payload should satisfy the current wait.
+        """
+        return bool(diagnostics)
+
+    def _wait_for_relevant_published_diagnostics(
+        self,
+        uri: str,
+        after_generation: int,
+        timeout: float,
+        allow_cached: bool = True,
+    ) -> list[ls_types.Diagnostic] | None:
+        """
+        Waits for a published diagnostics payload that is relevant for the current request.
+        """
+        deadline = monotonic() + timeout
+        current_after_generation = after_generation
+
+        while True:
+            remaining_timeout = deadline - monotonic()
+            if remaining_timeout <= 0:
+                break
+
+            diagnostics = self._wait_for_published_diagnostics(
+                uri=uri,
+                after_generation=current_after_generation,
+                timeout=remaining_timeout,
+            )
+            if diagnostics is None:
+                break
+            if self._accept_published_diagnostics(diagnostics):
+                return diagnostics
+            current_after_generation = self._get_published_diagnostics_generation(uri)
+
+        if allow_cached:
+            diagnostics = self._get_cached_published_diagnostics(uri)
+            if diagnostics is not None and self._accept_published_diagnostics(diagnostics):
+                return diagnostics
+
+        return None
+
+    def request_text_document_diagnostics(
+        self,
+        relative_file_path: str,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int = 4,
+    ) -> list[ls_types.Diagnostic]:
+        """
+        Raise a [textDocument/diagnostic](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_diagnostic) request to the Language Server
+        to find diagnostics for the given file. Wait for the response and return the result.
+
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for
+        :param start_line: the first 0-based line to include in the result.
+        :param end_line: the last 0-based line to include in the result. `-1` means no upper bound.
+        :param min_severity: minimum LSP severity to include, where 1=Error, 2=Warning, 3=Information, 4=Hint.
+            Diagnostics with lower-or-equal numeric severity are returned.
+
+        :return: A list of diagnostics for the file
+        """
+        uri = self._validate_text_document_diagnostics_request(relative_file_path, start_line, end_line, min_severity)
+        published_uri = self._get_published_diagnostics_uri(uri)
+        diagnostics_before_request = self._get_published_diagnostics_generation(published_uri)
+        ret: list[ls_types.Diagnostic] | None = None
+        pull_diagnostics_failed = False
+
+        with self.open_file(relative_file_path):
+            response: Any = None
+            # only send pull diagnostics when the server actually supports it; some servers
+            # (e.g. Julia's LanguageServer.jl) hard-error and crash the process on unknown methods
+            if self._supports_pull_diagnostics():
+                try:
+                    response = self.server.send.text_document_diagnostic(
+                        {
+                            LSPConstants.TEXT_DOCUMENT: {  # type: ignore
+                                LSPConstants.URI: uri,
+                            }
+                        }
+                    )
+                except SolidLSPException as ex:
+                    log.debug("Falling back to published diagnostics for %s due to pull-diagnostics error: %s", relative_file_path, ex)
+                    response = None
+                    pull_diagnostics_failed = True
+
+            if response is not None:
+                assert isinstance(response, dict), (
+                    f"Unexpected response from Language Server (expected list, got {type(response)}): {response}"
+                )
+                ret = []
+                for item in response["items"]:  # type: ignore
+                    new_item: ls_types.Diagnostic = {
+                        "uri": uri,
+                        "severity": item["severity"],
+                        "message": item["message"],
+                        "range": item["range"],
+                        "code": item.get("code"),  # type: ignore
+                    }
+                    if "source" in item:
+                        new_item["source"] = item["source"]
+                    ret.append(ls_types.Diagnostic(**new_item))
+
+            if not ret:
+                published_diagnostics = self._wait_for_relevant_published_diagnostics(
+                    uri=published_uri,
+                    after_generation=diagnostics_before_request,
+                    timeout=self._get_published_diagnostics_wait_timeout(pull_diagnostics_failed),
+                )
+                if published_diagnostics is not None:
+                    ret = published_diagnostics
+
+        if ret is None:
+            return []
+
+        return self._filter_diagnostics(ret, start_line, end_line, min_severity)
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         """
@@ -591,6 +1005,124 @@ class SolidLanguageServer(ABC):
         if the LS is not fully initialized yet.
         """
         return 2
+
+    # --- Cross-workspace / additional workspace folder support ---
+
+    @staticmethod
+    def _path_contains_dots(relative_file_path: str) -> bool:
+        """Check if a relative path traverses outside the workspace root via '..' components."""
+        return ".." in PurePath(relative_file_path).parts
+
+    def _resolve_file_uri(self, relative_file_path: str) -> str:
+        """Construct a canonical file URI from a relative path.
+
+        For cross-workspace paths containing '..', the path is resolved to
+        produce a clean URI without '..' segments.
+        """
+        p = pathlib.Path(os.path.join(self.repository_root_path, relative_file_path))
+        if self._path_contains_dots(relative_file_path):
+            p = p.resolve()
+            is_outside_of_configured_workspaces = True
+            configured_workspaces = [*self._additional_workspace_abs_paths, self.repository_root_path]
+            for workspace in configured_workspaces:
+                if p.is_relative_to(workspace):
+                    is_outside_of_configured_workspaces = False
+                    break
+            if is_outside_of_configured_workspaces:
+                raise ValueError(
+                    f"Path {relative_file_path} contains '..' segments and is outside of configured workspaces. "
+                    f"Configured workspaces: {configured_workspaces}. Resolved path: {p}."
+                )
+        return p.as_uri()
+
+    def _build_workspace_folders_param(self, repository_absolute_path: str) -> list[dict[str, str]]:
+        """Build the ``workspaceFolders`` list for LSP initialization.
+
+        Returns a list containing the primary workspace folder followed by any
+        additional workspace folders configured in settings.
+        """
+        root_uri = pathlib.Path(repository_absolute_path).as_uri()
+        folders: list[dict[str, str]] = [
+            {"uri": root_uri, "name": os.path.basename(repository_absolute_path)},
+        ]
+        for abs_folder in self._additional_workspace_abs_paths:
+            folder_uri = pathlib.Path(abs_folder).as_uri()
+            folders.append({"uri": folder_uri, "name": os.path.basename(abs_folder)})
+        if len(folders) > 1:
+            log.info("LSP multi-root workspace: %d folders", len(folders))
+        return folders
+
+    def _activate_additional_workspaces(self) -> None:
+        """Open a representative file from each additional workspace folder to
+        trigger project loading in the language server.
+
+        Many language servers only load projects on-demand when files are opened.
+        This method finds a source file in each additional workspace folder via
+        :meth:`_find_representative_source_file` and opens it, keeping it open
+        for the lifetime of this language server instance.
+
+        Subclasses must override :meth:`_find_representative_source_file` to
+        enable this feature; the default implementation raises ``NotImplementedError``.
+        """
+        opened_count = 0
+        for additional_workspace in self._additional_workspace_abs_paths:
+            source_file = self._find_representative_source_file(additional_workspace)
+            if source_file is None:
+                log.warning("No source file found in additional workspace folder: %s", additional_workspace)
+                continue
+
+            rel_path = os.path.relpath(source_file, self.repository_root_path)
+            log.info("Opening %s to trigger project loading for %s", rel_path, os.path.basename(additional_workspace))
+
+            abs_path = pathlib.Path(source_file).resolve()
+            uri = abs_path.as_uri()
+            language_id = self._get_language_id_for_file(rel_path)
+
+            self._signal_expect_indexing()
+            fb = LSPFileBuffer(
+                abs_path=abs_path,
+                uri=uri,
+                encoding=self._encoding,
+                version=0,
+                language_id=language_id,
+                ref_count=1,
+                language_server=self,
+                open_in_ls=True,
+            )
+            self.open_file_buffers[uri] = fb
+            opened_count += 1
+
+        if opened_count > 0:
+            log.info("Waiting for %d additional workspace(s) to index...", opened_count)
+            self._wait_for_additional_workspace_indexing()
+
+    def _find_representative_source_file(self, directory: str) -> str | None:
+        """Find a source file suitable for triggering project loading in the given directory.
+
+        Must be overridden by subclasses that support ``additional_workspace_folders``.
+        Return ``None`` if no suitable file is found.
+
+        :param directory: Absolute path to the workspace folder.
+        :return: Absolute path to a source file, or None.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not yet support additional_workspace_folders. "
+            f"Override _find_representative_source_file() to enable this feature."
+        )
+
+    def _signal_expect_indexing(self) -> None:
+        """Signal that new files are about to be opened and async indexing should be awaited.
+
+        Override in subclasses that track indexing progress (e.g. via $/progress).
+        Default implementation is a no-op.
+        """
+
+    def _wait_for_additional_workspace_indexing(self) -> None:
+        """Wait for additional workspace indexing to complete.
+
+        Override in subclasses that track indexing progress.
+        Default implementation is a no-op.
+        """
 
     def set_request_timeout(self, timeout: float | None) -> None:
         """
@@ -729,10 +1261,12 @@ class SolidLanguageServer(ABC):
         pass
 
     def _get_language_id_for_file(self, relative_file_path: str) -> str:
-        """Return the language ID for a file.
+        """
+        Determines the language identifier to pass to the language server for the given file,
+        particularly `textDocument/didOpen` requests.
 
-        Override in subclasses to return file-specific language IDs.
-        Default implementation returns self.language_id.
+        Override this method in subclasses to return file-specific language identifiers.
+        The default implementation returns the main identifier passed at construction (self.language_id).
         """
         return self.language_id
 
@@ -751,6 +1285,8 @@ class SolidLanguageServer(ABC):
             raise SolidLSPException("Language Server not started")
 
         absolute_file_path = Path(self.repository_root_path, relative_file_path)
+        if self._path_contains_dots(relative_file_path):
+            absolute_file_path = absolute_file_path.resolve()
         uri = absolute_file_path.as_uri()
 
         if uri in self.open_file_buffers:
@@ -798,7 +1334,7 @@ class SolidLanguageServer(ABC):
             be opened in the LS later by calling the `ensure_open_in_ls` method on the returned LSPFileBuffer.
         """
         if file_buffer is not None:
-            expected_uri = pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
+            expected_uri = self._resolve_file_uri(relative_file_path)
             assert file_buffer.uri == expected_uri, f"Inconsistency between provided {file_buffer.uri=} and {expected_uri=}"
             if open_in_ls:
                 file_buffer.ensure_open_in_ls()
@@ -821,8 +1357,7 @@ class SolidLanguageServer(ABC):
             log.error("insert_text_at_position called before Language Server started")
             raise SolidLSPException("Language Server not started")
 
-        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
-        uri = pathlib.Path(absolute_file_path).as_uri()
+        uri = self._resolve_file_uri(relative_file_path)
 
         # Ensure the file is open
         assert uri in self.open_file_buffers
@@ -864,8 +1399,7 @@ class SolidLanguageServer(ABC):
             log.error("delete_text_between_positions called before Language Server started")
             raise SolidLSPException("Language Server not started")
 
-        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
-        uri = pathlib.Path(absolute_file_path).as_uri()
+        uri = self._resolve_file_uri(relative_file_path)
 
         # Ensure the file is open
         assert uri in self.open_file_buffers
@@ -1054,9 +1588,7 @@ class SolidLanguageServer(ABC):
         return cast(
             DefinitionParams,
             {
-                LSPConstants.TEXT_DOCUMENT: {
-                    LSPConstants.URI: pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
-                },
+                LSPConstants.TEXT_DOCUMENT: {LSPConstants.URI: self._resolve_file_uri(relative_file_path)},
                 LSPConstants.POSITION: {
                     LSPConstants.LINE: line,
                     LSPConstants.CHARACTER: column,
@@ -1103,7 +1635,7 @@ class SolidLanguageServer(ABC):
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
         return self.server.send.references(
             {
-                "textDocument": {"uri": PathUtils.path_to_uri(os.path.join(self.repository_root_path, relative_file_path))},
+                "textDocument": {"uri": self._resolve_file_uri(relative_file_path)},
                 "position": {"line": line, "character": column},
                 "context": {"includeDeclaration": False},
             }
@@ -1210,7 +1742,7 @@ class SolidLanguageServer(ABC):
         :return: A list of completions
         """
         with self.open_file(relative_file_path):
-            open_file_buffer = self.open_file_buffers[pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()]
+            open_file_buffer = self.open_file_buffers[self._resolve_file_uri(relative_file_path)]
             completion_params: LSPTypes.CompletionParams = {
                 "position": {"line": line, "character": column},
                 "textDocument": {"uri": open_file_buffer.uri},
@@ -1327,9 +1859,7 @@ class SolidLanguageServer(ABC):
 
             # no cached result, query language server
             log.debug(f"Requesting document symbols for {relative_file_path} from the Language Server")
-            response = self.server.send.document_symbol(
-                {"textDocument": {"uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()}}
-            )
+            response = self.server.send.document_symbol({"textDocument": {"uri": self._resolve_file_uri(relative_file_path)}})
 
             # Only cache non-empty results. An empty or None response can occur when the language server
             # has not yet finished indexing or building the project (e.g. Lean 4 before `lake build`),
@@ -1768,7 +2298,7 @@ class SolidLanguageServer(ABC):
         with self.open_file(relative_file_path):
             response = self.server.send.signature_help(
                 {
-                    "textDocument": {"uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()},
+                    "textDocument": {"uri": self._resolve_file_uri(relative_file_path)},
                     "position": {
                         "line": line,
                         "character": column,
@@ -1879,10 +2409,13 @@ class SolidLanguageServer(ABC):
                 if containing_symbol is None and include_file_symbols:
                     log.warning(f"Could not find containing symbol for {ref_path}:{ref_line}:{ref_col}. Returning file symbol instead")
                     fileRange = self._get_range_from_file_content(file_data.contents)
+                    ref_abs_path = os.path.join(self.repository_root_path, ref_path)
+                    if self._path_contains_dots(ref_path):
+                        ref_abs_path = str(pathlib.Path(ref_abs_path).resolve())
                     location = ls_types.Location(
-                        uri=str(pathlib.Path(os.path.join(self.repository_root_path, ref_path)).as_uri()),
+                        uri=self._resolve_file_uri(ref_path),
                         range=fileRange,
-                        absolutePath=str(os.path.join(self.repository_root_path, ref_path)),
+                        absolutePath=ref_abs_path,
                         relativePath=ref_path,
                     )
                     name = os.path.splitext(os.path.basename(ref_path))[0]
@@ -1987,7 +2520,9 @@ class SolidLanguageServer(ABC):
         """
         # checking if the line is empty, unfortunately ugly and duplicating code, but I don't want to refactor
         with self.open_file(relative_file_path):
-            absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
+            absolute_file_path = os.path.join(self.repository_root_path, relative_file_path)
+            if self._path_contains_dots(relative_file_path):
+                absolute_file_path = str(pathlib.Path(absolute_file_path).resolve())
             content = FileUtils.read_file(absolute_file_path, self._encoding)
             if content.split("\n")[line].strip() == "":
                 log.error(f"Passing empty lines to request_container_symbol is currently not supported, {relative_file_path=}, {line=}")
@@ -2102,7 +2637,9 @@ class SolidLanguageServer(ABC):
         return definitions[0]
 
     def _get_document_symbols_with_locations(self, relative_file_path: str) -> list[ls_types.UnifiedSymbolInformation]:
-        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
+        abs_path = os.path.join(self.repository_root_path, relative_file_path)
+        if self._path_contains_dots(relative_file_path):
+            abs_path = str(pathlib.Path(abs_path).resolve())
         document_symbols = self.request_document_symbols(relative_file_path)
         symbols = list(document_symbols.iter_symbols())
 
@@ -2110,9 +2647,9 @@ class SolidLanguageServer(ABC):
         # symbol exposes a normalized location/range in the current workspace.
         for symbol in symbols:
             location = symbol["location"]
-            location["absolutePath"] = absolute_file_path
+            location["absolutePath"] = abs_path
             location["relativePath"] = relative_file_path
-            location["uri"] = Path(absolute_file_path).as_uri()
+            location["uri"] = self._resolve_file_uri(relative_file_path)
         return symbols
 
     @staticmethod
@@ -2540,9 +3077,7 @@ class SolidLanguageServer(ABC):
         :return: A WorkspaceEdit containing the changes needed to rename the symbol, or None if rename is not supported
         """
         params = RenameParams(
-            textDocument=ls_types.TextDocumentIdentifier(
-                uri=pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
-            ),
+            textDocument=ls_types.TextDocumentIdentifier(uri=self._resolve_file_uri(relative_file_path)),
             position=ls_types.Position(line=line, character=column),
             newName=new_name,
         )

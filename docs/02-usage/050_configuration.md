@@ -118,32 +118,26 @@ Examples of built-in modes include:
 
 Find the concrete definitions of these modes [here](https://github.com/oraios/serena/tree/main/src/serena/resources/config/modes).
 
-Active modes are configured in (from lowest to highest precedence):
+The modes to be activated are configured in:
   * the global configuration file (`serena_config.yml`)
+     - defines `base_modes`, which are always included
+     - defines `default_modes`, which can be overridden by projects or command line parameters
   * the project configuration file (`project.yml`)
+     - defines `default_modes` (overriding the default modes in the global configuration)
+     - defines `added_modes`, which are added on top
   * at startup via command-line parameters
+     - can override default modes with `--mode`
+     - can define modes to be added on top with `--add-mode`
 
-The two former sources define both **base modes** and **default modes**.
-Ultimately, the active modes are the union of base modes and default modes (after applying all overrides).
-Command-line parameters override default modes but not base modes.
-Base modes should thus be used to define modes that you always want to be active, regardless of command-line parameters.
+Ultimately, the active modes are given by the union of 
+  * `base_modes` defined in the global configuration (always active)  
+  * `default_modes` (defined in the global configuration, optionally overridden by the project/CLI)
+  * `added_modes` (defined in the project configuration/via CLI parameters)
 
-Command-line parameters for overriding default modes:
-When launching the MCP sever, specify modes using `--mode <mode-name>`; multiple modes can be specified, e.g. `--mode planning --mode no-onboarding`.
-
-:::{important}
-By default, Serena activates the two modes `interactive` and `editing` (as defined in the global configuration).
-
-As soon as you start to specify modes via the command line, only the modes you explicitly specify will be active, however.
-Therefore, if you want to keep the default modes, you must specify them as well.  
-For example, to add mode `no-memories` to the default behaviour, specify
-```shell
---mode interactive --mode editing --mode no-memories
-```
-
-If you want to keep certain modes as always active, regardless of command-line parameters, 
-define them as *base modes* in the global or project configuration.
-:::
+So you should 
+ * define modes you definitely always want to use in `base_modes`,
+ * define modes that you typically want to use but sometimes want to override in `default_modes`,
+ * use `added_modes` to add modes that you need only for specific projects/sessions.
 
 :::{note}
 **Mode Compatibility**: While you can combine modes, some may be semantically incompatible (e.g., `interactive` and `one-shot`). 
@@ -233,8 +227,13 @@ ls_specific_settings:
 
 This is supported by all language servers deriving their dependency provider from `LanguageServerDependencyProviderSinglePath`,
 and by some additional wrappers that explicitly expose `ls_path`.
-Common examples include: `ansible`, `bash`, `clojure`, `cpp`, `cpp_ccls`, `hlsl`, `kotlin`, `lean4`, `luau`, `markdown`, `php`,
-`php_phpactor`, `python`, `rust`, `solidity`, `systemverilog`, `toml`, `typescript`, and `yaml`.
+Common examples include: `ansible`, `bash`, `clojure`, `cpp`, `cpp_ccls`, `hlsl`, `html`, `kotlin`, `lean4`, `luau`, `markdown`, `php`,
+`php_phpactor`, `python`, `rust`, `scss`, `solidity`, `systemverilog`, `toml`, `typescript`, and `yaml`.
+
+Note: `angular` does **not** support `ls_path` — the Angular language server is part of a multi-process orchestration
+(`ngserver` plus a companion TypeScript language server with the `@angular/language-service` plugin and an HTML
+companion) where the dependency layout matters; use the version overrides documented in the Angular section below
+to pin specific releases of the bundled stack.
 
 If a language server supports `ls_path`, setting it bypasses Serena's managed download or install for that server.
 In that case, any server-specific version or registry settings only apply when `ls_path` is not set.
@@ -248,6 +247,36 @@ Supported settings:
 | Setting | Default | Description |
 |---|---|---|
 | `al_extension_version` | `18.0.2242655` | Override the AL VS Code extension version Serena downloads from the VS Code Marketplace. |
+
+#### Angular
+
+Serena uses `@angular/language-server` (`ngserver`) for the `angular` language key, orchestrated together with a
+companion `typescript-language-server` (with `@angular/language-service` loaded as a tsserver plugin) and a
+companion `vscode-html-language-server` for `.html` `documentSymbol`. This is an **experimental** language and
+must be explicitly listed in `project.yml`; it is not auto-detected.
+
+**Project requirements:**
+
+- The project itself must have `@angular/core` installed (i.e. `npm install` must have been run in the project root,
+  or in a workspace root above it for monorepo layouts). Without it, `ngserver` reports every file as "not in an
+  Angular project" and template-aware features silently return empty.
+- A `tsconfig.json` must be reachable at or above any opened `.ts` file.
+- Do **not** also list `typescript` or `html` in `languages` when `angular` is active — Angular subsumes both
+  for `.ts` / `.html` files. SCSS is **not** subsumed; list `scss` separately if needed.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `angular_language_server_version` | `21.2.10` | Override the bundled `@angular/language-server` npm package version Serena installs. |
+| `angular_language_service_version` | `21.2.10` | Override the bundled `@angular/language-service` tsserver plugin version. |
+| `typescript_version` | `5.9.3` | Override the bundled `typescript` npm package version. Falls back to `ls_specific_settings.typescript.typescript_version` if unset. |
+| `typescript_language_server_version` | `5.1.3` | Override the bundled `typescript-language-server` version. Falls back to `ls_specific_settings.typescript.typescript_language_server_version` if unset. |
+| `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. Falls back to `ls_specific_settings.typescript.npm_registry` if unset. |
+
+Notes:
+- The HTML companion (`vscode-html-language-server`) is configured via `ls_specific_settings.html` — see the HTML section below.
+- `ls_path` is not supported (see note above the AL section).
 
 #### Ansible
 
@@ -289,6 +318,29 @@ Supported settings:
 |---|---|---|
 | `ls_path` | managed download | Override the `clojure-lsp` executable path. |
 | `clojure_lsp_version` | `2026.02.20-16.08.58` | Override the `clojure-lsp` release version Serena downloads when `ls_path` is not set. |
+| `source_paths` | scanned from project descriptors (or unset if a project-local `.lsp/config.edn` is found) | Explicit list of repo-root-relative source paths to inject into clojure-lsp's `initializationOptions`. Use this when the auto-discovery picks up too few or too many paths. |
+| `config_edn_path` | unset | Path to a `config.edn` file whose `:source-paths` entry should be parsed and injected. Useful when the project's clojure-lsp config lives outside the standard `.lsp/config.edn` location. |
+
+**Why this exists**: clojure-lsp discovers source paths only from the project descriptor at the workspace root (root `deps.edn` / `project.clj` / `shadow-cljs.edn` / `bb.edn`) and does not recurse for sub-module descriptors. In multi-module monorepos (e.g. `common/` + `frontend/` + `backend/` layouts), this means references in sibling modules are silently missed by `find_referencing_symbols` until a tool call happens to open one of their files. Serena works around this by walking the repo for project descriptors at startup and passing the union of their declared source paths to clojure-lsp via `initializationOptions["source-paths"]`.
+
+**Resolution order** (first match wins):
+
+1. `source_paths` setting — explicit override.
+2. `config_edn_path` setting — Serena parses `:source-paths` from the supplied file.
+3. `<repo>/.lsp/config.edn` exists — Serena injects nothing; clojure-lsp reads the file natively, so hand-tuned project configs are never clobbered.
+4. Walk the repo for project descriptors and synthesise a source-paths list from their declared `:paths` / `:extra-paths` / `:source-paths` (skipping `.git`, `.clj-kondo`, `.lsp`, `.cpcache`, `node_modules`, `target`, `out`, `dist`).
+
+Example — a monorepo without a `.lsp/config.edn`, where you want to override what Serena scanned:
+
+```yaml
+ls_specific_settings:
+  clojure:
+    source_paths:
+      - "common/src"
+      - "common/test"
+      - "frontend/src"
+      - "backend/src"
+```
 
 #### C/C++ (`clangd`)
 
@@ -502,30 +554,94 @@ ls_specific_settings:
     renameSourceFolders: ["src", "lib"]
 ```
 
+#### HTML
+
+Serena uses `vscode-html-language-server` from Microsoft's `vscode-langservers-extracted` npm package for the
+`html` language key. **Experimental** — must be explicitly listed in `project.yml`; not auto-detected. The HTML
+LSP returns in-file element / id symbols via `documentSymbol`; cross-file `definition` / `references` are not
+meaningful for HTML and are not exposed.
+
+This same language server is also used as a tertiary companion by the Angular language server (see the Angular
+section), since `ngserver` does not implement `textDocument/documentSymbol` for `.html` files.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `ls_path` | managed install | Override the `vscode-html-language-server` executable path. |
+| `vscode_langservers_package` | `vscode-langservers-extracted` | npm package providing the binary. Set to `@t1ckbase/vscode-langservers-extracted` (or any other source) to use the actively-maintained 2026 fork. |
+| `vscode_langservers_version` | `4.10.0` | Override the npm package version Serena installs when `ls_path` is not set. |
+| `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. |
+
 #### Java (`eclipse.jdt.ls`)
+
+Java support has two installation modes:
+
+1. **Default vscode-java VSIX mode** (no extra config required): Serena downloads the platform-specific
+   vscode-java VSIX (~500 MB: JDTLS + bundled JRE 21 + Lombok + IntelliCode), Gradle distribution and
+   IntelliCode VSIX from public hosts on first use.
+2. **Upstream JDTLS mode** (offline-friendly): Activated by setting both `jdtls_path` and `lombok_path`.
+   Uses an existing JDTLS installation (~100 MB) and the system JDK 21+. Nothing is downloaded.
+   Recommended for restricted-network/corporate environments.
+
+**When to use which mode:**
+
+- **Default vscode-java VSIX mode** — recommended for most users. No setup required;
+  Serena downloads everything on first use.
+- **Upstream JDTLS mode** — recommended when:
+  - you cannot reach `github.com`, `services.gradle.org` or `marketplace.visualstudio.com`
+    from the host (corporate proxy, air-gapped network);
+  - you want a smaller on-disk footprint (~100 MB vs ~500 MB);
+  - you already maintain a JDTLS installation (e.g. for `nvim-jdtls` or another editor);
+  - your security policy prohibits per-project runtime downloads.
+
+**JDK 21+ is required** in upstream mode. Serena resolves the JDK in this order:
+`ls_specific_settings.java.java_home` → `JAVA_HOME` env var → first `java` on `PATH`.
+The resolved JVM is interrogated and rejected if its `java.specification.version` is below 21.
 
 The following settings are supported for the Java language server:
 
 | Setting | Default | Description |
 |---|---|---|
+| `jdtls_path` | `null` | Activates upstream JDTLS mode. Path to upstream JDTLS root (containing `plugins/` and `config_<platform>/`). Get via `brew install jdtls` or extract `jdt-language-server-*.tar.gz` from <https://download.eclipse.org/jdtls/snapshots/>. Must be set together with `lombok_path`. |
+| `lombok_path` | `null` | Path to the Lombok jar. Activates upstream JDTLS mode together with `jdtls_path`. Get from `~/.m2/repository/org/projectlombok/lombok/<ver>/lombok-<ver>.jar` or download from <https://projectlombok.org/downloads/>. |
+| `java_home` | `null` | (upstream-jdtls mode only) Path to JDK 21+ home directory used to launch JDTLS. Falls back to `JAVA_HOME` env var, then `which java`. |
 | `maven_user_settings` | `~/.m2/settings.xml` | Path to Maven `settings.xml` |
 | `gradle_user_home` | `~/.gradle` | Path to Gradle user home directory |
 | `gradle_wrapper_enabled` | `false` | Use the project's Gradle wrapper (`gradlew`) instead of the bundled Gradle distribution. Enable this for projects with custom plugins or repositories. |
 | `gradle_java_home` | `null` | Path to the JDK used by Gradle. When unset, Gradle uses the bundled JRE. |
 | `use_system_java_home` | `false` | Use the system's `JAVA_HOME` environment variable for JDTLS itself. Enable this if your project requires a specific JDK vendor or version for Gradle's JDK checks. |
-| `gradle_version` | `8.14.2` | Override the Gradle distribution version Serena downloads by default. |
-| `vscode_java_version` | `1.42.0-561` | Override the bundled `vscode-java` runtime bundle version Serena downloads by default. |
-| `intellicode_version` | `1.2.30` | Override the IntelliCode VSIX version Serena downloads by default. |
+| `gradle_version` | `8.14.2` | (vscode-java mode only) Override the Gradle distribution version Serena downloads by default. |
+| `vscode_java_version` | `1.54.0-923` | (vscode-java mode only) Override the bundled `vscode-java` runtime bundle version Serena downloads by default. |
+| `intellicode_version` | `1.2.30` | (vscode-java mode only) Override the IntelliCode VSIX version Serena downloads by default. |
+| `lombok_show_generated` | `true` | Show Lombok-generated methods (`getX/setX`, `builder()`, `equals/hashCode/toString`, `withX`, fluent accessors) in `find_symbol`, `get_symbols_overview` and the symbol-edit tools. Set to `false` to restore the previous JDTLS default and hide the synthetic methods (e.g. when `@Data` classes pollute the outline with too many getters/setters). Requires JDTLS commit `b2d8952` / `vscode-java >= 1.53.0`; the bundled default already meets this. |
 | `jdtls_xmx` | `3G` | Maximum heap size for the JDTLS server JVM. |
 | `jdtls_xms` | `100m` | Initial heap size for the JDTLS server JVM. |
-| `intellicode_xmx` | `1G` | Maximum heap size for the IntelliCode embedded JVM. |
-| `intellicode_xms` | `100m` | Initial heap size for the IntelliCode embedded JVM. |
+| `intellicode_xmx` | `1G` | (vscode-java mode only) Maximum heap size for the IntelliCode embedded JVM. |
+| `intellicode_xms` | `100m` | (vscode-java mode only) Initial heap size for the IntelliCode embedded JVM. |
 
-Note:
+Notes:
 - When overriding `vscode_java_version`, Serena still assumes that the downloaded runtime bundle keeps the same internal
   directory layout and file names as the bundled default version.
+- In upstream-jdtls mode, IntelliCode is not loaded (it's an ML completions ranker that is irrelevant to Serena's
+  symbol-tools workflow), and Serena does not ship a Gradle distribution. Maven projects work via JDTLS's bundled m2e.
+  Gradle projects must have `./gradlew` in the project, or rely on a system-installed Gradle through Buildship's
+  default discovery rules.
+- In upstream-jdtls mode the `gradle_version`, `vscode_java_version`, `intellicode_version`,
+  `intellicode_xmx`, `intellicode_xms` settings are silently ignored — they only apply to the
+  vscode-java VSIX mode.
 
-Example for a project with custom Gradle plugins and JDK requirements:
+Example: upstream-jdtls mode (offline / corporate network):
+
+```yaml
+ls_specific_settings:
+  java:
+    jdtls_path: "/opt/homebrew/Cellar/jdtls/1.50.0/libexec"
+    lombok_path: "/Users/me/.m2/repository/org/projectlombok/lombok/1.18.38/lombok-1.18.38.jar"
+    # java_home: "/opt/homebrew/opt/openjdk@21"  # optional
+```
+
+Example: default vscode-java VSIX mode for a project with custom Gradle plugins:
 
 ```yaml
 ls_specific_settings:
@@ -752,6 +868,26 @@ Supported settings:
 | `on_stale_lock` | `auto-clean` | How Serena handles stale Metals H2 database locks. Supported values: `auto-clean`, `warn`, `fail`. |
 | `log_multi_instance_notice` | `true` | Log a notice when another Metals instance is detected. |
 
+#### SCSS / Sass / CSS
+
+Serena uses [`some-sass-language-server`](https://github.com/wkillerud/some-sass) for the `scss` language key.
+**Experimental** — must be explicitly listed in `project.yml`; not auto-detected. Some Sass was chosen over the
+generic `vscode-css-language-server` because it provides full workspace-wide `@use` / `@forward` go-to-definition
+and find-references for variables, mixins, functions, and placeholders.
+
+Handles `.scss`, `.sass`, and `.css`. The three are dispatched by the LSP language id (`scss`, `sass`, `css`) and
+share the same engine; CSS feature toggles default to off upstream and Serena flips them on at startup so that
+plain CSS gets symbols, definitions, references, hover, and completion. Lint diagnostics are deliberately left
+off (the rules are opinionated about vendor prefixes / empty rules / etc.); only syntax-level diagnostics surface.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `ls_path` | managed install | Override the `some-sass-language-server` executable path. |
+| `some_sass_version` | `2.3.8` | Override the npm package version Serena installs when `ls_path` is not set. |
+| `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. |
+
 #### Solidity
 
 Serena uses `@nomicfoundation/solidity-language-server` for Solidity support.
@@ -808,6 +944,9 @@ Supported settings:
 | `typescript_version` | `5.9.3` | Override the bundled `typescript` npm package version Serena installs when `ls_path` is not set. |
 | `typescript_language_server_version` | `5.1.3` | Override the bundled `typescript-language-server` npm package version Serena installs when `ls_path` is not set. |
 | `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. |
+
+TypeScript supports [additional workspace folders](additional-workspace-folders) for cross-package
+reference discovery. Configure `additional_workspace_folders` in `project.yml` to enable this feature.
 
 #### TypeScript via `vtsls`
 

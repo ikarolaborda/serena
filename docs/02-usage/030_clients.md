@@ -101,8 +101,32 @@ You can do this in Tools / GitHub Copilot / Chat, where at the bottom you can cl
 
 ## Claude Code
 
-Serena is a great way to make Claude Code both cheaper and more powerful!
-To add Serena to Claude Code, you can simply run `serena setup claude-code`. Alternatively, follow the instructions below.
+Serena is a great way to make Claude Code both more efficient and more powerful!
+To set up the Serena MCP server for Claude Code, you can simply run this command: 
+
+    serena setup claude-code
+
+Find manual setup instructions as well as workarounds for Claude Code's recent regressions pertaining to (external) tool use below.
+
+:::{attention}
+Recent updates to Claude Code (CC) and to the Opus line of models resulted in drastically reduced
+adherence to instructions pertaining to Serena's tools.
+
+After extensive analysis, we identified part of the reason to be very long and detailed
+tool descriptions for built-in tools and parts of the default system prompt. 
+The descriptions of CC's system tools take almost 16k tokens, cannot be adjusted by the user,
+and introduce a very strong bias towards internal tools, making it almost impossible to convince Opus 4.7 to use Serena.
+
+As a workaround, we crafted a system prompt that counteracts this bias.
+When using Serena, we highly recommend that you start CC as 
+
+```shell
+claude --system-prompt="$(serena prompts print-cc-system-prompt-override)"
+```
+
+You can also consider adding the content of `serena cc-system-prompt-override` to your `CLAUDE.md` files,
+but the effect be insufficient for counteracting Claude Code's bias towards internal tools.
+:::
 
 **Global Configuration**. To add the Serena MCP server for all your projects, use the user-level configuration of claude code and the `--project-from-cwd` flag:
 
@@ -194,9 +218,9 @@ The hooks will:
   `grep` or `read_file` calls without using any Serena tools in between.
 - **`activate`**: Prompt the agent to activate the project and read Serena's instructions at session start.
 - **`cleanup`**: Clean up hook session data when the session ends.
-- **`auto-approve`**: Auto-approve Serena tool calls whenever Claude Code is in `acceptEdits` mode,
-  so blanket edit approvals cover Serena's destructive tools (e.g. `replace_symbol_body`,
-  `rename_symbol`) instead of prompting on every call.
+- **`auto-approve`**: Auto-approve Serena tool calls whenever Claude Code is in a permissive
+  permission mode (`acceptEdits` or `auto`), so blanket approvals cover Serena's destructive
+  tools (e.g. `replace_symbol_body`, `rename_symbol`) instead of prompting on every call.
 
 For more details on Claude Code's hook system, see the
 [Claude Code hooks documentation](https://code.claude.com/docs/en/hooks).
@@ -294,9 +318,67 @@ The Codex app does not start a session in the project's directory, so when using
 asking Codex to "Activate the current dir as project using serena" at the start of each session (though Codex might
 do this automatically).
 
-**Hooks.** The Codex hook system is less refined than of VSCode or Claude Code, but Codex also displays less drift
-and is better in using Serena's tools out of the box. If you use the Codex app, you can consider setting up the 
-SessionStart hook (see above) to remind the agent to activate the project directory.
+**Hooks.**
+Codex supports lifecycle hooks; see the
+[Codex hooks documentation](https://developers.openai.com/codex/hooks) for details. To enable
+Serena's hooks for Codex, add this feature flag to `~/.codex/config.toml`:
+
+```toml
+[features]
+codex_hooks = true
+```
+
+Then create `~/.codex/hooks.json` with the following content:
+
+```json
+{
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "serena-hooks remind --client=codex"
+                    }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "matcher": "startup|resume",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "serena-hooks activate --client=codex"
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "serena-hooks cleanup --client=codex"
+                    }
+                ]
+            }
+        ]
+    }
+}
+```
+
+The hooks will:
+
+- **`activate`**: Prompt the agent to activate the current project and read Serena's instructions
+  when a Codex session starts or resumes.
+- **`remind`**: Nudge the agent to use Serena's symbolic tools when it makes too many consecutive
+  code-search or code-file-read calls without using Serena tools in between.
+- **`cleanup`**: Clean up hook session data when the session ends.
+
+The `PreToolUse` matcher is intentionally restricted to `Bash`. The Serena reminder hook for Codex
+tracks shell-based grep and code-file reads, so running it for every tool call is unnecessary.
 
 ## Claude Desktop
 

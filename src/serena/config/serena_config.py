@@ -173,8 +173,20 @@ class NamedToolInclusionDefinition(ToolInclusionDefinition):
 
 @dataclass
 class ModeSelectionDefinition:
-    base_modes: Sequence[str] | None = None
     default_modes: Sequence[str] | None = None
+
+
+@dataclass
+class ModeSelectionDefinitionWithBaseModes(ModeSelectionDefinition):
+    base_modes: Sequence[str] | None = ("interactive", "editing")
+    """
+    the base modes to use, which are always guaranteed to be included
+    """
+
+
+@dataclass
+class ModeSelectionDefinitionWithAddedModes(ModeSelectionDefinition):
+    added_modes: Sequence[str] | None = None
 
 
 class LanguageBackend(Enum):
@@ -233,7 +245,7 @@ class LineEnding(Enum):
 
 
 @dataclass
-class SharedConfig(ModeSelectionDefinition, ToolInclusionDefinition, ToStringMixin):
+class SharedConfig(ToolInclusionDefinition, ToStringMixin):
     """Shared between SerenaConfig and ProjectConfig, the latter used to override values in the form
     (same as in ModeSelectionDefinition).
     The defaults here shall be none and should be set to the global default values in SerenaConfig.
@@ -260,10 +272,11 @@ Uses $projectDir and $projectFolderName as placeholders.
 
 
 @dataclass(kw_only=True)
-class ProjectConfig(SharedConfig):
+class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
     project_name: str
     languages: list[Language]
     ignored_paths: list[str] = field(default_factory=list)
+    additional_workspace_folders: list[str] = field(default_factory=list)
     read_only: bool = False
     ignore_all_files_in_gitignore: bool = True
     initial_prompt: str = ""
@@ -475,11 +488,16 @@ class ProjectConfig(SharedConfig):
         fixed_tools = data["fixed_tools"] or []
         excluded_tools = data["excluded_tools"] or []
         included_optional_tools = data["included_optional_tools"] or []
+        additional_workspace_folders = data.get("additional_workspace_folders") or []
+
+        if "base_modes" in data and data["base_modes"] is not None:
+            log.warning("The base_modes setting in project.yml is deprecated and will be ignored.")
 
         return cls(
             project_name=data["project_name"],
             languages=languages,
             ignored_paths=ignored_paths,
+            additional_workspace_folders=additional_workspace_folders,
             excluded_tools=excluded_tools,
             fixed_tools=fixed_tools,
             included_optional_tools=included_optional_tools,
@@ -491,7 +509,7 @@ class ProjectConfig(SharedConfig):
             encoding=data["encoding"],
             line_ending=line_ending,
             language_backend=language_backend,
-            base_modes=data["base_modes"],
+            added_modes=data["added_modes"],
             default_modes=data["default_modes"],
             symbol_info_budget=symbol_info_budget,
             ls_specific_settings=data.get("ls_specific_settings", {}),
@@ -682,7 +700,7 @@ class RegisteredProject(ToStringMixin):
 
 
 @dataclass(kw_only=True)
-class SerenaConfig(SharedConfig):
+class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     """
     Holds the Serena agent configuration, which is typically loaded from a YAML configuration file
     (when instantiated via :method:`from_config_file`), which is updated when projects are added or removed.
@@ -737,7 +755,6 @@ class SerenaConfig(SharedConfig):
     """
     the language backend to use for code understanding features
     """
-    default_modes: Sequence[str] | None = ("interactive", "editing")
     line_ending: LineEnding = LineEnding.NATIVE
     symbol_info_budget: float = 10.0
     """
@@ -875,7 +892,18 @@ class SerenaConfig(SharedConfig):
                 if path is None:
                     continue
                 num_migrations += 1
-            project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            try:
+                project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            except Exception as e:
+                log.error(
+                    "Failed to load project configuration for %s: %s. "
+                    "This project will be skipped. Fix or delete its "
+                    ".serena/project.yml (or remove it from "
+                    "serena_config.yml) to re-enable it.",
+                    path,
+                    e,
+                )
+                continue
             project = RegisteredProject(
                 project_root=str(path),
                 project_config=project_config,
