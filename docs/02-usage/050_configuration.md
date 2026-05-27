@@ -227,7 +227,7 @@ ls_specific_settings:
 
 This is supported by all language servers deriving their dependency provider from `LanguageServerDependencyProviderSinglePath`,
 and by some additional wrappers that explicitly expose `ls_path`.
-Common examples include: `ansible`, `bash`, `clojure`, `cpp`, `cpp_ccls`, `hlsl`, `html`, `kotlin`, `lean4`, `luau`, `markdown`, `php`,
+Common examples include: `ansible`, `bash`, `bsl`, `clojure`, `cpp`, `cpp_ccls`, `hlsl`, `html`, `kotlin`, `lean4`, `luau`, `markdown`, `php`,
 `php_phpactor`, `python`, `rust`, `scss`, `solidity`, `systemverilog`, `toml`, `typescript`, and `yaml`.
 
 Note: `angular` does **not** support `ls_path` — the Angular language server is part of a multi-process orchestration
@@ -307,6 +307,29 @@ Supported settings:
 | `ls_path` | managed install | Override the `bash-language-server` executable path. |
 | `bash_language_server_version` | `5.6.0` | Override the npm package version Serena installs when `ls_path` is not set. |
 | `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. |
+
+#### BSL (1C:Enterprise / OneScript)
+
+Serena uses [bsl-language-server](https://github.com/1c-syntax/bsl-language-server) by 1c-syntax
+for BSL support. The JAR is downloaded automatically on first use and SHA-256-verified for the
+bundled default version. **Requires Java 21+ on `PATH`** — bsl-language-server v0.29.0 is built
+with `targetCompatibility = JavaVersion.VERSION_21` and fails to launch under older JDKs.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `ls_path` | managed download | Override the path to an existing `bsl-language-server-*-exec.jar`. When set, Serena does not download anything; the JAR is launched directly via `java -jar`. |
+| `bsl_ls_version` | `0.29.0` | Override the bsl-language-server release version Serena downloads when `ls_path` is not set. SHA-256 verification is performed only for the default version; user-overridden versions install without SHA verification. |
+
+Example:
+
+```yaml
+ls_specific_settings:
+  bsl:
+    bsl_ls_version: "0.29.0"
+    # ls_path: "/opt/bsl/bsl-language-server-0.29.0-exec.jar"  # optional
+```
 
 #### Clojure
 
@@ -462,6 +485,27 @@ Supported settings:
 | Setting | Default | Description |
 |---|---|---|
 | `fsautocomplete_version` | `0.83.0` | Override the FsAutoComplete version Serena installs as a .NET tool. |
+
+
+#### GDScript (Godot Engine)
+
+Serena connects to the Godot editor's built-in LSP server over TCP. No separate process is launched.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `port` | `6008` | TCP port the running Godot editor listens on for LSP connections. |
+| `request_timeout` | `30.0` | Seconds to wait for a response from the Godot LSP server. |
+
+Example:
+
+```yaml
+ls_specific_settings:
+  gdscript:
+    port: 6008
+    request_timeout: 60.0
+```
 
 
 #### Go (`gopls`)
@@ -948,6 +992,26 @@ Supported settings:
 TypeScript supports [additional workspace folders](additional-workspace-folders) for cross-package
 reference discovery. Configure `additional_workspace_folders` in `project.yml` to enable this feature.
 
+#### Svelte
+
+Serena uses `svelte-language-server` for the `svelte` language key. Use `svelte` for Svelte projects instead of also listing `typescript`, unless you intentionally want multiple language servers active for the same files.
+
+A companion TypeScript language server (`typescript-language-server` + `typescript-svelte-plugin`) is spawned automatically alongside the Svelte LSP. The plugin makes the TypeScript program `.svelte`-aware so that cross-file operations — rename, go-to-definition, and find-references from `.ts`/`.js` files — correctly include `.svelte` consumers. Serena merges and deduplicates reference results from both servers automatically.
+
+Supported settings:
+
+| Setting | Default | Description |
+|---|---|---|
+| `ls_path` | managed install | Override the `svelteserver` executable path. |
+| `svelte_language_server_version` | `0.18.0` | Override the `svelte-language-server` npm package version Serena installs. |
+| `typescript_version` | `6.0.3` (falls back to `ls_specific_settings.typescript.typescript_version`) | Override the `typescript` npm package version used as the shared tsdk. |
+| `typescript_language_server_version` | `5.1.3` (falls back to `ls_specific_settings.typescript.typescript_language_server_version`) | Override the `typescript-language-server` npm package version for the companion server. |
+| `typescript_svelte_plugin_version` | `0.3.52` | Override the `typescript-svelte-plugin` npm package version used for `.svelte`-aware TS resolution. |
+| `npm_registry` | `null` | Override the npm registry Serena uses for all managed installs. |
+| `initialization_options_configuration` | `{}` | Deep-merge overrides for any of the ten plugin configuration sections (`svelte`, `prettier`, `emmet`, `typescript`, `javascript`, `js/ts`, `css`, `less`, `scss`, `html`). |
+
+All four packages are tracked via a version file; changing any version setting triggers a clean reinstall.
+
 #### TypeScript via `vtsls`
 
 The actual configuration key for vtsls is `typescript_vts`, not `vts`.
@@ -958,6 +1022,30 @@ Supported settings:
 |---|---|---|
 | `vtsls_version` | `0.2.9` | Override the `@vtsls/language-server` npm package version Serena installs. |
 | `npm_registry` | `null` | Override the npm registry Serena uses for the managed install. |
+| `initialization_options` | `null` | Dict forwarded to vtsls on three LSP channels: the `initializationOptions` field of the `initialize` request, a `workspace/didChangeConfiguration` notification sent right after initialize, and as the response to `workspace/configuration` pull requests (section-scoped). Typical use is Yarn PnP: point `typescript.tsdk` at the Yarn-generated SDK and enable `vtsls.autoUseWorkspaceTsdk`. |
+
+Example (Yarn PnP project with TypeScript in a subdirectory; run `yarn dlx @yarnpkg/sdks vscode` in the project once to generate the SDK):
+
+```yaml
+ls_specific_settings:
+  typescript_vts:
+    initialization_options:
+      typescript:
+        tsdk: "project/.yarn/sdks/typescript/lib"
+      vtsls:
+        autoUseWorkspaceTsdk: true
+```
+
+vtsls reads `typescript.tsdk` through the `workspace/configuration` pull, not through `initializationOptions`, so Serena answers those pulls from the same dict (and also pushes it on `workspace/didChangeConfiguration` for compatibility with servers that expect the notification). Without `autoUseWorkspaceTsdk: true`, vtsls falls back to its bundled TypeScript and ignores `tsdk` (there is no UI prompt to confirm the switch in a headless LSP).
+
+The dict is forwarded to vtsls verbatim — Serena does not validate its structure. For the list of supported keys and their expected types, refer to the vtsls [configuration schema](https://github.com/yioneko/vtsls/blob/main/packages/service/configuration.schema.json) and the underlying [VS Code TypeScript settings](https://code.visualstudio.com/docs/languages/typescript). `null` (the default) and `{}` are both treated as "unset": no `initializationOptions` are sent and no `workspace/didChangeConfiguration` notification is pushed. A non-dict value (e.g. a string or list) raises an error at server start.
+
+**Troubleshooting:**
+
+- *vtsls keeps using its bundled TypeScript and ignores `tsdk`* — ensure `vtsls.autoUseWorkspaceTsdk: true` is set alongside `typescript.tsdk`. Without it vtsls does not auto-switch to the workspace TS in a headless LSP.
+- *tsserver fails to start after pointing at a custom `tsdk`* — verify the path resolves to a directory containing `tsserver.js` (e.g. `.yarn/sdks/typescript/lib`, not `.yarn/sdks/typescript`). Relative paths are interpreted relative to the project root.
+- *Setting appears in `solidlsp` logs but vtsls does not react* — cross-check the key against the vtsls configuration schema linked above. The dict is forwarded as-is, so an unknown or wrong-typed key is silently ignored by vtsls.
+- *Need to inspect what Serena is actually forwarding* — the dict is logged at INFO level via the `Forwarding user-provided initializationOptions to vtsls: …` line at language server startup.
 
 #### Vue
 

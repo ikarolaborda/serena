@@ -3,9 +3,10 @@
 These tests cover:
 - Stale generated PromptFactory: ``__getattr__`` falls back to dynamic rendering
   for templates that exist on disk but are missing from the generated subclass.
-- MemoriesManager under multi-threaded contention: atomic writes + per-file
+- MemoryManager under multi-threaded contention: atomic writes + per-file
   cross-process locks must not lose updates or yield partial reads.
 """
+
 from __future__ import annotations
 
 import threading
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from interprompt.prompt_factory import PromptFactoryBase
-from serena.project import MemoriesManager
+from serena.project import MemoryManager
 
 
 class TestPromptFactoryStaleGenerated:
@@ -53,13 +54,13 @@ class TestPromptFactoryStaleGenerated:
             factory.totally_unrelated_attribute  # type: ignore[attr-defined]
 
 
-class TestMemoriesManagerConcurrency:
+class TestMemoryManagerConcurrency:
     """Multi-thread contention; cross-process semantics are inherited from filelock."""
 
-    def _make(self, tmp_path: Path) -> MemoriesManager:
+    def _make(self, tmp_path: Path) -> MemoryManager:
         data = tmp_path / ".serena"
         data.mkdir()
-        return MemoriesManager(serena_data_folder=str(data))
+        return MemoryManager(serena_data_folder=str(data))
 
     def test_concurrent_save_never_yields_partial_read(self, tmp_path: Path) -> None:
         mm = self._make(tmp_path)

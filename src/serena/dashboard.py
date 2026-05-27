@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Self
 
 import psutil
-from flask import Flask, Response, redirect, request, send_from_directory
+from flask import Flask, Response, abort, redirect, request, send_from_directory
 from PIL import Image
 from pydantic import BaseModel
 from sensai.util import logging
@@ -665,7 +665,7 @@ class SerenaDashboardAPI:
         # Get available memories if ReadMemoryTool is active
         available_memories = None
         if self._agent.tool_is_active("read_memory") and project is not None:
-            available_memories = project.memories_manager.list_memories().get_full_list()
+            available_memories = project.memory_manager.list_memories().get_full_list()
 
         # Get list of languages for the active project
         languages = []
@@ -719,7 +719,7 @@ class SerenaDashboardAPI:
             if project is None:
                 raise ValueError("No active project")
 
-            content = project.memories_manager.load_memory(request_get_memory.memory_name)
+            content = project.memory_manager.load_memory(request_get_memory.memory_name)
             return ResponseGetMemory(content=content, memory_name=request_get_memory.memory_name)
 
         return self._agent.execute_task(run, logged=False)
@@ -729,7 +729,7 @@ class SerenaDashboardAPI:
             project = self._agent.get_active_project()
             if project is None:
                 raise ValueError("No active project")
-            project.memories_manager.save_memory(request_save_memory.memory_name, request_save_memory.content, is_tool_context=False)
+            project.memory_manager.save_memory(request_save_memory.memory_name, request_save_memory.content, is_tool_context=False)
 
         self._agent.execute_task(run, logged=True, name="SaveMemory")
 
@@ -738,7 +738,7 @@ class SerenaDashboardAPI:
             project = self._agent.get_active_project()
             if project is None:
                 raise ValueError("No active project")
-            project.memories_manager.delete_memory(request_delete_memory.memory_name, is_tool_context=False)
+            project.memory_manager.delete_memory(request_delete_memory.memory_name, is_tool_context=False)
 
         self._agent.execute_task(run, logged=True, name="DeleteMemory")
 
@@ -748,9 +748,7 @@ class SerenaDashboardAPI:
             if project is None:
                 raise ValueError("No active project")
 
-            return project.memories_manager.move_memory(
-                request_rename_memory.old_name, request_rename_memory.new_name, is_tool_context=False
-            )
+            return project.memory_manager.move_memory(request_rename_memory.old_name, request_rename_memory.new_name, is_tool_context=False)
 
         return self._agent.execute_task(run, logged=True, name="RenameMemory")
 
@@ -890,7 +888,15 @@ class SerenaDashboardAPI:
 
         cli.show_server_banner = lambda *args, **kwargs: None
 
+        # Verify host and port on each request to prevent DNS-rebinding-based attacks
+        @self._app.before_request
+        def check_host() -> None:
+            allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if request.host not in allowed:
+                abort(403)
+
         self._app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+
         return port
 
     def run_in_thread(self, host: str) -> tuple[threading.Thread, int]:
