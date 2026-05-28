@@ -2403,6 +2403,7 @@ $(function setupMemorySyncPanel() {
     const $current = $('#memory-sync-current');
     const $credsState = $('#memory-sync-creds-state');
     const $encryption = $('#memory-sync-encryption');
+    const $localBackup = $('#memory-sync-local-backup');
     const $output = $('#memory-sync-last-output');
     const $credsTable = $('#memory-sync-creds-table tbody');
 
@@ -2430,6 +2431,13 @@ $(function setupMemorySyncPanel() {
             $credsState.text(data.credentials_present ? 'all required keys present' : 'missing — set them below');
             const enc = data.encryption || '—';
             $encryption.text(enc === 'plain' ? 'PLAIN — at-rest encryption disabled' : enc);
+            const lb = data.local_backup;
+            if (lb && lb.ts) {
+                const labels = (lb.sources || []).map(function (s) { return s.label; }).join(', ');
+                $localBackup.text(fmtTs(lb.ts) + ' — ' + (lb.outcome || '?') + (labels ? ' (' + labels + ')' : ''));
+            } else {
+                $localBackup.text('never');
+            }
         }).fail(function (xhr) {
             $outcome.text('status error: ' + xhr.status);
         });
@@ -2495,13 +2503,19 @@ $(function setupMemorySyncPanel() {
     $('#memory-sync-dry-run').on('click', function () { trigger(true); });
     $('#memory-sync-save-creds').on('click', saveCredentials);
 
-    // Lazy-load when the section is first expanded.
+    // Refresh when the section is expanded. The generic `.collapsible-header` toggle
+    // runs on the same click; the bind order between the two handlers is not guaranteed,
+    // so checking `$panel.is(':visible')` synchronously can still observe the pre-toggle
+    // state and skip the refresh (leaving the panel showing "—"). Defer to the next tick
+    // so the toggle has applied before we decide whether to load.
     $('#memory-sync-header').on('click', function () {
-        if ($panel.is(':visible')) {
-            refreshStatus();
-            refreshCredentials();
-            refreshRecent();
-        }
+        setTimeout(function () {
+            if ($panel.is(':visible')) {
+                refreshStatus();
+                refreshCredentials();
+                refreshRecent();
+            }
+        }, 0);
     });
 
     // Recent syncs (project-aware) — populated from /memory_sync/recent.
@@ -2539,5 +2553,11 @@ $(function setupMemorySyncPanel() {
             }
         }, 10000);
     }
+
+    // Populate once on load so the panel shows current data the moment it is expanded,
+    // independent of click/animation timing.
+    refreshStatus();
+    refreshCredentials();
+    refreshRecent();
     startPolling();
 });
