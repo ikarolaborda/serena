@@ -53,7 +53,16 @@ R2_REQUIRED_KEYS = (
     "R2_BUCKET",
     "R2_ENDPOINT",
 )
-"""Keys the qdrant-memory r2-push.sh script validates as required."""
+"""Keys projected into .env.r2 / shown in the credentials UI."""
+
+R2_AUTH_KEYS = (
+    "R2_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_ENDPOINT",
+)
+"""The R2 credentials proper. R2_BUCKET is a *target*, not a secret: r2-push.sh
+resolves the bucket per project, so it must not gate "credentials present"."""
 
 DEFAULT_QDRANT_MEMORY_DIR = "~/Aerolambda/qdrant-memory"
 """Sibling repo path; override with the SERENA_QDRANT_MEMORY_DIR env var."""
@@ -131,6 +140,10 @@ class MemorySyncService:
         self._watcher: MemorySyncWatcher | None = None
         # Always-on local backup so memories survive R2 being unreachable.
         self._mirror = LocalMemoryMirror(qdrant_memory_dir=self._qdrant_dir)
+        # Bootstrap the encrypted store from any credentials already projected to
+        # .env.r2 (e.g. configured directly in qdrant-memory) so the dashboard
+        # recognises them instead of falsely reporting "missing".
+        self.import_r2_credentials_from_env()
 
     @staticmethod
     def _resolve_qdrant_dir(override: str | os.PathLike[str] | None) -> Path:
@@ -192,6 +205,69 @@ class MemorySyncService:
             stored.setdefault(k, "")
         return stored
 
+    @staticmethod
+    def _parse_env_file(path: Path) -> dict[str, str]:
+        """Parse a shell-style ``KEY=value`` env file into a dict (values unquoted)."""
+        result: dict[str, str] = {}
+        if not path.exists():
+            return result
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                result[key.strip()] = value.strip().strip('"').strip("'")
+        except OSError as e:
+            log.warning("could not read env file %s: %s", path, e)
+        return result
+
+    def read_env_r2_values(self) -> dict[str, str]:
+        """Non-empty ``R2_*`` values from the projected ``.env.r2`` (fallback source)."""
+        env = self._qdrant_dir / ".env.r2"
+        return {k: v for k, v in self._parse_env_file(env).items() if k.startswith("R2_") and v}
+
+    def import_r2_credentials_from_env(self) -> list[str]:
+        """Backfill the encrypted store from ``.env.r2`` for keys not already stored.
+
+        Idempotent and best-effort: only fills keys that are absent/empty in the
+        SecretsStore, never overwrites, and never raises into construction.
+        """
+        imported: list[str] = []
+        for key, value in self.read_env_r2_values().items():
+            try:
+                if not self._secrets.get_secret(R2_SCOPE, key):
+                    self._secrets.set_secret(R2_SCOPE, key, value)
+                    imported.append(key)
+            except Exception as e:
+                log.warning("could not import %s from .env.r2: %s", key, e)
+        if imported:
+            log.info("imported %d R2 credential(s) from .env.r2 into the encrypted store", len(imported))
+        return imported
+
+    def credential_status(self) -> dict[str, dict[str, Any]]:
+        """Per-key presence + source across the SecretsStore and ``.env.r2``."""
+        env_values = self.read_env_r2_values()
+        status: dict[str, dict[str, Any]] = {}
+        for k in R2_REQUIRED_KEYS:
+            in_store = bool(self._secrets.get_secret(R2_SCOPE, k))
+            in_env = bool(env_values.get(k))
+            status[k] = {
+                "present": in_store or in_env,
+                "source": "secrets" if in_store else ("env" if in_env else None),
+                "required": k in R2_AUTH_KEYS,
+            }
+        return status
+
+    def credentials_present(self) -> bool:
+        """True when all R2 auth keys are available (encrypted store or .env.r2).
+
+        R2_BUCKET is intentionally excluded: it is resolved per-project by
+        r2-push.sh and is not an authentication secret.
+        """
+        status = self.credential_status()
+        return all(status[k]["present"] for k in R2_AUTH_KEYS)
+
     def set_r2_credentials(self, values: dict[str, str], *, write_through_env: bool = True) -> None:
         for k, v in values.items():
             if v is None:
@@ -201,24 +277,27 @@ class MemorySyncService:
             self.write_env_r2_file()
 
     def write_env_r2_file(self, target_path: str | os.PathLike[str] | None = None) -> Path:
-        """Project the SQLite-resident credentials into qdrant-memory/.env.r2.
+        """Project the encrypted credentials into qdrant-memory/.env.r2.
 
-        Done as an atomic temp-rename so a partial write never leaves the
-        consumer script reading a half-populated file.
+        Merges with the existing file rather than overwriting it: keys already
+        present in .env.r2 (e.g. QDRANT_URL, or a manually-set R2_BUCKET) are
+        preserved, and a stored value is only written when non-empty. This
+        guarantees an empty SecretsStore can never clobber working credentials.
+        Done as an atomic temp-rename so a partial write is never observed.
         """
         target = Path(target_path) if target_path is not None else (self._qdrant_dir / ".env.r2")
-        values = self._secrets.list_scope(R2_SCOPE)
+        merged = self._parse_env_file(target)
+        for k, v in self._secrets.list_scope(R2_SCOPE).items():
+            if v:
+                merged[k] = v
         lines = [
-            "# Auto-generated by Serena MemorySyncService — do not edit by hand.",
-            "# Source of truth: ~/.serena/secrets.sqlite3 (scope=r2).",
+            "# Managed by Serena MemorySyncService (merged with existing values).",
+            "# Credentials source of truth: ~/.serena/secrets.sqlite3 (scope=r2).",
             "",
         ]
-        for k in R2_REQUIRED_KEYS:
-            v = values.get(k, "")
-            lines.append(f"{k}={_quote_env(v)}")
-        # Preserve any caller-supplied keys outside the required set
-        for k in sorted(set(values) - set(R2_REQUIRED_KEYS)):
-            lines.append(f"{k}={_quote_env(values[k])}")
+        ordered = [k for k in R2_REQUIRED_KEYS if k in merged] + sorted(k for k in merged if k not in R2_REQUIRED_KEYS)
+        for k in ordered:
+            lines.append(f"{k}={_quote_env(merged[k])}")
         atomic_write_text(target, "\n".join(lines) + "\n", encoding="utf-8")
         # The credentials are sensitive — drop the projected file to 0600
         try:
@@ -330,9 +409,11 @@ class MemorySyncService:
             run.outcome = "unavailable"
             run.notes = f"r2-push.sh not found at {script}"
             return
-        # Missing required keys is an actionable, non-transient failure —
-        # surface it before launching the subprocess.
-        missing = [k for k in R2_REQUIRED_KEYS if not self._secrets.get_secret(R2_SCOPE, k)]
+        # Missing auth credentials is an actionable, non-transient failure —
+        # surface it before launching the subprocess. Checks both the encrypted
+        # store and .env.r2; R2_BUCKET is excluded (resolved per-project).
+        status = self.credential_status()
+        missing = [k for k in R2_AUTH_KEYS if not status[k]["present"]]
         if missing:
             run.outcome = "failed"
             run.notes = f"missing R2 credentials: {', '.join(missing)}"
