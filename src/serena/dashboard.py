@@ -387,9 +387,9 @@ class SerenaDashboardAPI:
                 "summary": summary.to_dict(),
                 "current_run": current.to_dict() if current else None,
                 "last_run": last.to_dict() if last else None,
-                "credentials_present": all(
-                    self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS
-                ),
+                "credentials_present": self._memory_sync.credentials_present(),
+                "credentials_detail": (_cred_detail := self._memory_sync.credential_status()),
+                "bucket_configured": _cred_detail["R2_BUCKET"]["present"],
                 "encryption": self._memory_sync.secrets.encryption_label,
                 "local_backup": self._memory_sync.local_backup_state(),
             }
