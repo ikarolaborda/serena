@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from serena.memory_mirror import LocalMemoryMirror
 from serena.memory_sync_history import MemorySyncHistory, MemorySyncWatcher
 from serena.util.atomic_io import atomic_write_text
 from serena.util.secrets_store import SecretsStore
@@ -128,6 +129,8 @@ class MemorySyncService:
             active_project_provider if active_project_provider is not None else lambda: None
         )
         self._watcher: MemorySyncWatcher | None = None
+        # Always-on local backup so memories survive R2 being unreachable.
+        self._mirror = LocalMemoryMirror(qdrant_memory_dir=self._qdrant_dir)
 
     @staticmethod
     def _resolve_qdrant_dir(override: str | os.PathLike[str] | None) -> Path:
@@ -150,17 +153,29 @@ class MemorySyncService:
     def history(self) -> MemorySyncHistory:
         return self._history
 
+    @property
+    def mirror(self) -> LocalMemoryMirror:
+        return self._mirror
+
+    def local_backup_state(self) -> dict[str, Any] | None:
+        """Latest local-backup outcome, for dashboard status (None if never run)."""
+        return self._mirror.latest_state()
+
     def start_watcher(self) -> None:
         """Start polling the state file for externally-triggered syncs.
 
         Idempotent; safe to call multiple times. Stops on agent shutdown
-        because the thread is daemon-flagged.
+        because the thread is daemon-flagged. The watcher also refreshes the
+        local backup mirror whenever it observes a change, so the local copy
+        stays current even between explicit syncs.
         """
         if self._watcher is None:
             self._watcher = MemorySyncWatcher(
                 state_file=self._qdrant_dir / "data" / "r2-state.json",
                 history=self._history,
                 active_project_provider=self._active_project_provider,
+                on_change=lambda: self._mirror.mirror_now("watcher"),
+                change_watch_paths=[self._mirror.serena_memories_dir],
             )
         self._watcher.start()
 
@@ -275,6 +290,9 @@ class MemorySyncService:
             with self._lock:
                 self._last_run = run
                 self._current_run = None
+            # Refresh the local backup regardless of the R2 outcome: when R2 is
+            # unreachable this is exactly the copy that keeps memories durable.
+            self._mirror.mirror_now(f"post-sync:{run.outcome}")
             # Always record self-events: the operator wants the history to
             # show failed/unavailable attempts too, not only successful pushes.
             if self._watcher is not None:

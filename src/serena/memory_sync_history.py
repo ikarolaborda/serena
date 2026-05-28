@@ -31,10 +31,9 @@ import json
 import logging
 import os
 import threading
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -160,16 +159,23 @@ class MemorySyncWatcher:
         history: MemorySyncHistory,
         active_project_provider: Callable[[], str | None],
         poll_seconds: float = WATCHER_POLL_SECONDS_DEFAULT,
+        on_change: Callable[[], None] | None = None,
+        change_watch_paths: Sequence[str | os.PathLike[str]] | None = None,
     ) -> None:
         self._state_file = Path(state_file)
         self._history = history
         self._active_project_provider = active_project_provider
         self._poll_seconds = poll_seconds
+        # Fired when a sync is observed or a watched memory path changes, so a
+        # consumer (the local backup mirror) can refresh itself promptly.
+        self._on_change = on_change
+        self._change_watch_paths = [Path(p) for p in (change_watch_paths or [])]
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         # Seed from disk so a watcher restart does not flood the JSONL with
         # the same already-recorded snapshot id.
         self._last_snapshot_id = self._seed_snapshot_id()
+        self._last_change_sig = self._change_signature()
 
     def _seed_snapshot_id(self) -> str | None:
         push = self._read_last_push()
@@ -206,7 +212,46 @@ class MemorySyncWatcher:
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
+            self._poll_changes()
             self._stop.wait(self._poll_seconds)
+
+    def _change_signature(self) -> float:
+        """Newest mtime across the watched memory paths (0.0 if none/absent).
+
+        Used to detect local memory edits cheaply; the watched trees are small
+        (markdown memories). Directory renames from atomic writes bump mtimes.
+        """
+        newest = 0.0
+        for root in self._change_watch_paths:
+            if not root.exists():
+                continue
+            try:
+                newest = max(newest, root.stat().st_mtime)
+                for p in root.rglob("*"):
+                    try:
+                        newest = max(newest, p.stat().st_mtime)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return newest
+
+    def _poll_changes(self) -> bool:
+        """Fire ``on_change`` when a watched memory path has been modified.
+
+        Returns True iff a change was detected. Never raises into the loop.
+        """
+        if self._on_change is None or not self._change_watch_paths:
+            return False
+        sig = self._change_signature()
+        if sig <= self._last_change_sig:
+            return False
+        self._last_change_sig = sig
+        try:
+            self._on_change()
+        except Exception as e:
+            log.warning("watcher on_change (memory edit) failed: %s", e)
+        return True
 
     def poll_once(self) -> bool:
         """Returns True iff a new sync was observed and appended to history."""
@@ -237,6 +282,11 @@ class MemorySyncWatcher:
             )
         )
         log.info("watcher recorded external sync %s", snap)
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception as e:
+                log.warning("watcher on_change (new snapshot) failed: %s", e)
         return True
 
     def record_self_event(
@@ -264,13 +314,13 @@ class MemorySyncWatcher:
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 __all__ = [
+    "HISTORY_FILENAME",
+    "WATCHER_POLL_SECONDS_DEFAULT",
     "MemorySyncHistory",
     "MemorySyncWatcher",
     "SyncEvent",
-    "HISTORY_FILENAME",
-    "WATCHER_POLL_SECONDS_DEFAULT",
 ]

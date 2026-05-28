@@ -401,6 +401,7 @@ class SerenaDashboardAPI:
                 "last_run": last.to_dict() if last else None,
                 "credentials_present": all(self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS),
                 "encryption": self._memory_sync.secrets.encryption_label,
+                "local_backup": self._memory_sync.local_backup_state(),
             }
 
         @self._app.route("/memory_sync/trigger", methods=["POST"])
