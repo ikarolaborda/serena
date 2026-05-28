@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Self
 
 import psutil
+from filelock import Timeout as FileLockTimeout
 from flask import Flask, Response, abort, redirect, request, send_from_directory
 from PIL import Image
 from pydantic import BaseModel
@@ -29,8 +30,6 @@ from serena.task_executor import TaskExecutor
 from serena.util.atomic_io import atomic_write_text, cross_process_lock
 from serena.util.logging import MemoryLogHandler
 from serena.util.pywebview import WebViewWithTray
-
-from filelock import Timeout as FileLockTimeout
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -392,6 +391,7 @@ class SerenaDashboardAPI:
                     self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS
                 ),
                 "encryption": self._memory_sync.secrets.encryption_label,
+                "local_backup": self._memory_sync.local_backup_state(),
             }
 
         @self._app.route("/memory_sync/trigger", methods=["POST"])
