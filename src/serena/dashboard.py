@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Self
 
 import psutil
-from flask import Flask, Response, abort, redirect, request, send_from_directory
+from filelock import Timeout as FileLockTimeout
+from flask import Flask, Response, redirect, request, send_from_directory
 from PIL import Image
 from pydantic import BaseModel
 from sensai.util import logging
@@ -29,8 +30,6 @@ from serena.task_executor import TaskExecutor
 from serena.util.atomic_io import atomic_write_text, cross_process_lock
 from serena.util.logging import MemoryLogHandler
 from serena.util.pywebview import WebViewWithTray
-
-from filelock import Timeout as FileLockTimeout
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -201,11 +200,16 @@ class SerenaDashboardAPI:
         tool_names: list[str],
         agent: "SerenaAgent",
         tool_usage_stats: ToolUsageStats | None = None,
+        host: str = "127.0.0.1",
+        trusted_hosts: list[str] | None = None,
     ) -> None:
         self._memory_log_handler = memory_log_handler
         self._tool_names = tool_names
         self._agent = agent
+        self._host = host
         self._app = Flask(__name__)
+        if trusted_hosts:
+            self._app.config["TRUSTED_HOSTS"] = trusted_hosts
         self._tool_usage_stats = tool_usage_stats
         self._loaded_news: dict[str, str] = {}
         self._news_ready = threading.Event()
@@ -215,7 +219,12 @@ class SerenaDashboardAPI:
         self._memory_sync.start_watcher()
         self._setup_routes()
         self._read_news = ReadNews.load()
-        # Fetch remote news in background on startup (non-blocking)
+
+        # register callback for config changes
+        self._current_config_overview: dict[str, Any] | None = None
+        self._agent.register_config_changed_callback(self._on_agent_config_changed)
+
+        # fetch remote news in background on startup (non-blocking)
         threading.Thread(target=self._fetch_news, daemon=True).start()
 
     @property
@@ -288,8 +297,10 @@ class SerenaDashboardAPI:
 
         @self._app.route("/get_config_overview", methods=["GET"])
         def get_config_overview() -> dict[str, Any]:
-            result = self._agent.execute_task(self._get_config_overview, logged=False)
-            return result.model_dump()
+            result = self._current_config_overview
+            if result is None:
+                raise ValueError("Config overview not yet available")
+            return result
 
         @self._app.route("/shutdown", methods=["PUT"])
         def shutdown() -> dict[str, str]:
@@ -388,9 +399,7 @@ class SerenaDashboardAPI:
                 "summary": summary.to_dict(),
                 "current_run": current.to_dict() if current else None,
                 "last_run": last.to_dict() if last else None,
-                "credentials_present": all(
-                    self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS
-                ),
+                "credentials_present": all(self._memory_sync.secrets.get_secret(R2_SCOPE, k) for k in R2_REQUIRED_KEYS),
                 "encryption": self._memory_sync.secrets.encryption_label,
             }
 
@@ -567,7 +576,7 @@ class SerenaDashboardAPI:
         if self._tool_usage_stats is not None:
             self._tool_usage_stats.clear()
 
-    def _get_config_overview(self) -> ResponseConfigOverview:
+    def _compute_config_overview(self) -> ResponseConfigOverview:
         from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
         from serena.tools.tools_base import Tool
 
@@ -694,6 +703,9 @@ class SerenaDashboardAPI:
             current_client=Tool.get_last_tool_call_client_str(),
             serena_version=self._agent.version,
         )
+
+    def _on_agent_config_changed(self) -> None:
+        self._current_config_overview = self._compute_config_overview().model_dump()
 
     def _get_available_languages(self) -> ResponseAvailableLanguages:
         from solidlsp.ls_config import Language
@@ -879,7 +891,7 @@ class SerenaDashboardAPI:
 
         raise RuntimeError(f"No free ports found starting from {start_port}")
 
-    def run(self, host: str, port: int) -> int:
+    def run(self, port: int) -> int:
         """
         Runs the dashboard on the given host and port and returns the port number.
         """
@@ -887,41 +899,32 @@ class SerenaDashboardAPI:
         from flask import cli
 
         cli.show_server_banner = lambda *args, **kwargs: None
-
-        # Verify host and port on each request to prevent DNS-rebinding-based attacks
-        @self._app.before_request
-        def check_host() -> None:
-            allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
-            if request.host not in allowed:
-                abort(403)
-
-        self._app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
-
+        self._app.run(host=self._host, port=port, debug=False, use_reloader=False, threaded=True)
         return port
 
-    def run_in_thread(self, host: str) -> tuple[threading.Thread, int]:
+    def run_in_thread(self) -> tuple[threading.Thread, int]:
         # _find_first_free_port releases its socket before we hand the port to werkzeug;
         # under concurrent Serena startups another instance can grab the same port in that
         # gap. Build the WSGI server here so bind happens synchronously, retry on collision.
         from werkzeug.serving import make_server
 
-        port = self._find_first_free_port(self.BASE_PORT, host)
+        port = self._find_first_free_port(self.BASE_PORT, self._host)
         max_retries = 10
         last_error: OSError | None = None
         server = None
         for _ in range(max_retries):
             try:
-                server = make_server(host, port, self._app, threaded=True)
+                server = make_server(self._host, port, self._app, threaded=True)
                 break
             except OSError as e:
                 last_error = e
                 # Another process won the race; advance and try again.
-                port = self._find_first_free_port(port + 1, host)
+                port = self._find_first_free_port(port + 1, self._host)
         if server is None:
             assert last_error is not None
             raise RuntimeError(f"Could not bind dashboard after {max_retries} attempts") from last_error
 
-        log.info("Starting dashboard (listen_address=%s, port=%d)", host, port)
+        log.info("Starting dashboard (listen_address=%s, port=%d)", self._host, port)
         thread = threading.Thread(target=server.serve_forever, name="serena-dashboard", daemon=True)
         thread.start()
         return thread, port
@@ -939,13 +942,14 @@ def open_url_in_browser(url: str, use_subprocess: bool = False) -> None:
     if use_subprocess:
         # Use a subprocess to avoid any output from webbrowser.open being written to stdout
         try:
-            subprocess.Popen(
+            p = subprocess.Popen(
                 [sys.executable, "-c", f"import webbrowser; webbrowser.open({url!r})"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=False,
             )
+            threading.Thread(target=p.wait, daemon=True).start()
         except Exception as e:
             # Subprocess creation can fail in rare cases (e.g. on some Linux systems; possibly subprocess/glibc bug)
             # See #1363

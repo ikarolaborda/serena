@@ -30,12 +30,11 @@ import re
 import shlex
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
-from collections.abc import Callable
 
 from serena.memory_sync_history import MemorySyncHistory, MemorySyncWatcher
 from serena.util.atomic_io import atomic_write_text
@@ -345,8 +344,8 @@ class MemorySyncService:
             run.notes = f"bash not found: {e}"
             return
         run.exit_code = proc.returncode
-        run.stdout_tail = (proc.stdout or "")[-self._OUTPUT_TAIL_BYTES:]
-        run.stderr_tail = (proc.stderr or "")[-self._OUTPUT_TAIL_BYTES:]
+        run.stdout_tail = (proc.stdout or "")[-self._OUTPUT_TAIL_BYTES :]
+        run.stderr_tail = (proc.stderr or "")[-self._OUTPUT_TAIL_BYTES :]
         run.outcome = "ok" if proc.returncode == 0 else "failed"
 
     def _reconcile_state(self, run: SyncRunResult) -> None:
@@ -390,13 +389,13 @@ def _quote_env(value: str) -> str:
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 __all__ = [
+    "R2_REQUIRED_KEYS",
+    "R2_SCOPE",
     "MemorySyncService",
     "SyncRunResult",
     "SyncSummary",
-    "R2_SCOPE",
-    "R2_REQUIRED_KEYS",
 ]

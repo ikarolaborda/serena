@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from types import SimpleNamespace
 
 from serena.analytics import ProjectSwitchEvent, ProjectSwitchStats
@@ -18,6 +19,9 @@ class _DummyAgent:
     def __init__(self, project: SimpleNamespace | None, switch_stats: ProjectSwitchStats | None = None) -> None:
         self._project = project
         self._switch_stats = switch_stats or ProjectSwitchStats()
+
+    def register_config_changed_callback(self, callback: Callable[[], None]) -> None:
+        pass
 
     def execute_task(self, func, *, logged: bool | None = None, name: str | None = None):
         del logged, name
@@ -58,7 +62,9 @@ def test_available_languages_exclude_project_languages():
 def test_get_project_switches_endpoint_returns_json_serializable_summary():
     switch_stats = ProjectSwitchStats()
     switch_stats.record(ProjectSwitchEvent(activation_id=1, from_project=None, to_project="alpha", shutdown_ms=0.0, ls_init_started=True))
-    switch_stats.record(ProjectSwitchEvent(activation_id=2, from_project="alpha", to_project="beta", shutdown_ms=12.5, ls_init_started=True))
+    switch_stats.record(
+        ProjectSwitchEvent(activation_id=2, from_project="alpha", to_project="beta", shutdown_ms=12.5, ls_init_started=True)
+    )
 
     agent = _DummyAgent(project=None, switch_stats=switch_stats)
     dashboard = SerenaDashboardAPI(memory_log_handler=_DummyMemoryLogHandler(), tool_names=[], agent=agent, tool_usage_stats=None)

@@ -7,8 +7,26 @@ Status of the `main` branch. Changes prior to the next official version change w
     The dict is forwarded to vtsls via `initializationOptions`, `workspace/didChangeConfiguration`,
     and `workspace/configuration` pulls. Enables Yarn PnP setups with `typescript.tsdk` pointing
     at the Yarn-generated SDK.
+  - `SvelteLanguageServer`: Fix diagnostics requests for TypeScript/JavaScript files incorrectly being
+    processed by the Svelte LS instead of the TypeScript LS.
+  - Improve quoting of arguments in shell executions
+
+* JetBrains:
+  - Add configuration option `jetbrains_launch_command`, allowing Serena to spawn IDE instances automatically
+    upon project activation
+
+* Dashboard:
+  - Make list of trusted hosts configurable, fixing host validation introduced in v1.5.2 allowing only
+    default local hostnames, effectively preventing remote connections
+  - Decouple configuration computation from the agent's task queue by introducing events for agent config/status updates.
+    This allows the dashboard to display the configuration while the project provided at startup is still initialising. #1064
+  - Fix empty executions queue displaying "Loading..."
+  - Tray manager: Add NixOS-support for AppIndicator-based trays (e.g., most Wayland-trays) to the package in flake.nix.
+  - Fix: Wait for the subprocess that opens the browser window, preventing zombie processes #1488 
 
 # v1.5.3 (2026-05-26)
+
+Add meta-data for the GitHub MCP registry
 
 # v1.5.2 (2026-05-26)
 
@@ -16,6 +34,9 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Not existing paths return `False` on is ignored checks (instead of raising an error)
   - Add `serena-agent` CLI command so that `uvx serena-agent` can be used as entrypoint.
   - Fortls and pyright are now installed on the fly instead of being bundled in the serena-agent package.
+
+* Dashboard:
+  - Add host validation
 
 * Hooks:
   - Extend list of extensions that are considered code files (affects the reminder hook counter).
