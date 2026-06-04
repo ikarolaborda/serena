@@ -1,0 +1,33 @@
+# Scans declared dependencies in pyproject.toml against the PyPI Advisory DB.
+# Runs on PRs to main, pushes to main, and weekly so a new CVE doesn't sit
+# unnoticed between merges. Fails the job on findings so they show up in the
+# checks UI; suppress noisy / inapplicable advisories via --ignore-vuln below.
+---
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (PyPI Advisory DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Audit project dependencies
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          # `.` audits the local project (reads pyproject.toml).
+          inputs: .

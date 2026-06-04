@@ -174,6 +174,15 @@ class MemorySyncService:
         """Latest local-backup outcome, for dashboard status (None if never run)."""
         return self._mirror.latest_state()
 
+    def _refresh_local_mirror(self) -> None:
+        """Watcher callback: refresh the local mirror, discarding the result.
+
+        Wrapped in a method (rather than passing the MirrorResult-returning
+        ``mirror_now`` directly) so the on_change signature stays typed as
+        ``Callable[[], None]``.
+        """
+        self._mirror.mirror_now("watcher")
+
     def start_watcher(self) -> None:
         """Start polling the state file for externally-triggered syncs.
 
@@ -187,7 +196,7 @@ class MemorySyncService:
                 state_file=self._qdrant_dir / "data" / "r2-state.json",
                 history=self._history,
                 active_project_provider=self._active_project_provider,
-                on_change=lambda: self._mirror.mirror_now("watcher"),
+                on_change=self._refresh_local_mirror,
                 change_watch_paths=[self._mirror.serena_memories_dir],
             )
         self._watcher.start()
@@ -270,8 +279,6 @@ class MemorySyncService:
 
     def set_r2_credentials(self, values: dict[str, str], *, write_through_env: bool = True) -> None:
         for k, v in values.items():
-            if v is None:
-                continue
             self._secrets.set_secret(R2_SCOPE, k, str(v))
         if write_through_env:
             self.write_env_r2_file()
